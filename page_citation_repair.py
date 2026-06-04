@@ -316,12 +316,14 @@ with _tab2:
                 new_fname   = new_file.name
 
                 new_analysis = analyze_merge_damage(new_bytes_m)
+                old_analysis = analyze_merge_damage(old_bytes_m)
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Bibliography entries",  new_analysis.get("bib_count", 0))
-                col2.metric("Cited in text (new)",   new_analysis.get("cited_count", 0))
-                col3.metric("Citations lost",         new_analysis.get("lost_in_merge", 0),
-                            delta=f'-{new_analysis.get("lost_in_merge",0)}' if new_analysis.get("lost_in_merge",0) else None,
-                            delta_color="inverse")
+                col1.metric("Citations in OLD (available to restore)",
+                            old_analysis.get("endnote_sees", 0))
+                col2.metric("Citations EndNote sees in NEW",
+                            new_analysis.get("endnote_sees", 0))
+                col3.metric("Bibliography entries (new)",
+                            new_analysis.get("bib_count", 0))
 
                 if st.button("Restore citations from old document", type="primary"):
                     with st.spinner("Matching paragraphs and restoring citations..."):

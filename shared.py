@@ -543,15 +543,6 @@ div[data-testid="stExpander"] details > summary svg {
   color: var(--ink-dim) !important;
   fill: var(--ink-dim) !important;
 }
-div[data-testid="stExpander"] div[data-testid="stMarkdownContainer"] p,
-div[data-testid="stExpander"] div[data-testid="stMarkdownContainer"] * {
-  color: var(--ink-mid) !important;
-  font-family: 'Source Sans 3', sans-serif !important;
-}
-  /* Hide raw text nodes (the _arr leak) by making the container font-size 0
-     then restoring it on real child elements */
-  font-size: 0 !important;
-}
 div[data-testid="stExpander"] details > summary::-webkit-details-marker { display: none !important; }
 div[data-testid="stExpander"] details > summary::marker { display: none !important; content: "" !important; }
 div[data-testid="stExpander"] details > summary:hover { background: var(--bg2) !important; }
