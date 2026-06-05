@@ -82,6 +82,16 @@ with t2:
                 f"**{r['orphan_bib_entries']}** are no longer cited (removed sections) "
                 f"and will drop out when EndNote rebuilds the bibliography."
             )
+            if r.get("footnote_locations"):
+                st.caption(
+                    f"Includes **{r['footnote_locations']}** citation group(s) in "
+                    f"footnotes (the 'References …' lists): "
+                    f"**{r.get('footnote_exact', 0)}** transplanted, "
+                    f"**{r.get('footnote_constructed', 0)}** assembled, "
+                    f"**{r.get('footnote_placeholders', 0)}** placeholder(s). "
+                    "Transplanted footnote cites show as superscript until you "
+                    "Update Citations; EndNote re-renders them to match your style."
+                )
             st.info("Go to tab 3 to download. Open in Word → Update Citations and "
                     "Bibliography. The 'assembled' ones occasionally get rejected by "
                     "EndNote; any that show as INVALID can be re-inserted from your "

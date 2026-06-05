@@ -36,6 +36,7 @@ with st.sidebar:
     "figure_extractor":    ("06", "Figure Extractor",       "Crop & export figures from PDF/Word"),
     "citation_rebuild":    ("07", "Citation Rebuild",       "Detect · Map · Rebuild broken citations"),
     "citation_bibrelink":  ("08", "Bibliography Relink",    "Relink superscript cites via bibliography + old doc"),
+    "citation_verifier":   ("09", "Citation Verifier",     "Check each citation against the text before it (A/B/PubMed)"),
 }
 
     def _nav(key):
@@ -62,6 +63,7 @@ elif page == "figure_inventory":   exec(open("page_figure_inventory.py").read())
 elif page == "figure_extractor":   exec(open("page_figure_extractor.py").read())
 elif page == "citation_rebuild":   exec(open("page_citation_rebuild.py").read())
 elif page == "citation_bibrelink":  exec(open("page_citation_bibrelink.py").read())
+elif page == "citation_verifier":  exec(open("page_citation_verifier.py").read())
 # ── Final expander fix (must be last so it wins the cascade) ──────────────────
 st.markdown("""
 <style>
