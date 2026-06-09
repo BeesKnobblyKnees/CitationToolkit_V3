@@ -37,6 +37,7 @@ with st.sidebar:
     "citation_rebuild":    ("07", "Citation Rebuild",       "Detect · Map · Rebuild broken citations"),
     "citation_bibrelink":  ("08", "Bibliography Relink",    "Relink superscript cites via bibliography + old doc"),
     "citation_verifier":   ("09", "Citation Verifier",     "Check each citation against the text before it (A/B/PubMed)"),
+    "citation_listing":   ("10", "Citation List", "In-order list matching EndNote Edit & Manage"),
 }
 
     def _nav(key):
@@ -64,6 +65,7 @@ elif page == "figure_extractor":   exec(open("page_figure_extractor.py").read())
 elif page == "citation_rebuild":   exec(open("page_citation_rebuild.py").read())
 elif page == "citation_bibrelink":  exec(open("page_citation_bibrelink.py").read())
 elif page == "citation_verifier":  exec(open("page_citation_verifier.py").read())
+elif page == "citation_listing":  exec(open("page_citation_listing.py").read())
 # ── Final expander fix (must be last so it wins the cascade) ──────────────────
 st.markdown("""
 <style>

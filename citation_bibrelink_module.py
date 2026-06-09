@@ -37,8 +37,36 @@ def _surname(author):
     return m.group(1).lower() if m else None
 
 
+def _format_ref(rest):
+    """Build a disambiguating display: author+title snippet, then the journal
+    and year (which sit after the title in Vancouver style and would otherwise
+    be truncated away). Year and journal are appended in brackets so they are
+    always visible even when the title is long."""
+    rest = rest.strip()
+    snippet = rest[:80].rstrip()
+    if len(rest) > 80:
+        snippet += "\u2026"
+    journal, year = "", ""
+    yrs = list(re.finditer(r'\b(?:18|19|20)\d{2}\b', rest))
+    if yrs:
+        ym = yrs[-1]
+        year = ym.group(0)
+        pre = rest[:ym.start()].rstrip().rstrip(".").strip()
+        segs = re.split(r'\.\s+', pre)          # journal = last sentence-segment before the year
+        if segs:
+            cand = segs[-1].strip(" .,")
+            if 0 < len(cand) <= 60 and re.search(r'[A-Za-z]', cand):
+                journal = cand
+    if journal and year:
+        return f"{snippet}  [{journal}, {year}]"
+    if year:
+        return f"{snippet}  [{year}]"
+    return snippet
+
+
 def parse_bibliography(draft_bytes):
-    """Map in-text/bibliography number -> (surname, year) and -> display text."""
+    """Map in-text/bibliography number -> (surname, year) and -> display text.
+    Display text includes journal + year for disambiguation."""
     d = docx.Document(io.BytesIO(draft_bytes))
     bib, bibtext = {}, {}
     for p in d.paragraphs:
@@ -50,7 +78,7 @@ def parse_bibliography(draft_bytes):
             continue
         yr = re.findall(r'\b(18|19|20)(\d{2})\b', rest)
         am = re.match(r'^([A-Z][a-zA-Z\-]+)', rest)
-        bibtext[num] = rest[:110]
+        bibtext[num] = _format_ref(rest)
         if yr and am:
             bib[num] = (am.group(1).lower(), yr[-1][0] + yr[-1][1])
     return bib, bibtext
