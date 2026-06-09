@@ -294,3 +294,95 @@ if __name__ == "__main__":
     f = zipfile.ZipFile(io.BytesIO(fixed)).read("word/footnotes.xml").decode()
     print("body begins/ends:", x.count('fldCharType="begin"'), x.count('fldCharType="end"'))
     print("foot begins/ends:", f.count('fldCharType="begin"'), f.count('fldCharType="end"'))
+
+
+def build_placeholders_docx(placeholders, title="Citation Placeholders to Insert"):
+    """Render the placeholder list as a readable Word table:
+    one row per placeholder, the [[REF #]] bold, each reference on its own line.
+    placeholders: list of (nums_list, joined_text) where joined_text is
+    ' | '-joined reference displays aligned 1:1 with nums_list."""
+    import io as _io
+    from docx import Document
+    from docx.shared import Pt, RGBColor, Inches
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    ACCENT, FILL = "8B1A1A", "F3ECEC"
+
+    def shade(cell, fill):
+        tcPr = cell._tc.get_or_add_tcPr(); sh = OxmlElement('w:shd')
+        sh.set(qn('w:val'), 'clear'); sh.set(qn('w:color'), 'auto'); sh.set(qn('w:fill'), fill)
+        tcPr.append(sh)
+
+    def grid(table):
+        b = OxmlElement('w:tblBorders')
+        for e in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
+            x = OxmlElement('w:' + e)
+            x.set(qn('w:val'), 'single'); x.set(qn('w:sz'), '4')
+            x.set(qn('w:space'), '0'); x.set(qn('w:color'), 'CCCCCC'); b.append(x)
+        tblPr = table._tbl.tblPr; anchor = None
+        for c in tblPr:
+            if c.tag in (qn('w:shd'), qn('w:tblLayout'), qn('w:tblLook')):
+                anchor = c; break
+        anchor.addprevious(b) if anchor is not None else tblPr.append(b)
+
+    doc = Document()
+    sec = doc.sections[0]
+    sec.left_margin = sec.right_margin = Inches(0.8); sec.top_margin = sec.bottom_margin = Inches(0.8)
+    doc.styles['Normal'].font.name = 'Calibri'; doc.styles['Normal'].font.size = Pt(10)
+
+    h = doc.add_paragraph(); r = h.add_run(title)
+    r.bold = True; r.font.size = Pt(16); r.font.color.rgb = RGBColor.from_string(ACCENT)
+    note = doc.add_paragraph()
+    nr = note.add_run("Each row is one citation location that could not be auto-relinked. "
+                      "Open the relinked .docx in Word, Update Citations and Bibliography, "
+                      "then insert the reference(s) listed for each [[REF #]] marker. "
+                      "Journal and year are shown to disambiguate similar authors/titles.")
+    nr.font.size = Pt(8.5); nr.italic = True; nr.font.color.rgb = RGBColor.from_string("666666")
+    cnt = doc.add_paragraph(); cr = cnt.add_run("%d placeholder location(s)." % len(placeholders))
+    cr.font.size = Pt(9); cr.bold = True
+    doc.add_paragraph()
+
+    table = doc.add_table(rows=1, cols=2); grid(table)
+    hdr = table.rows[0]
+    for i, txt in enumerate(["Placeholder", "Reference(s) to insert at this location"]):
+        c = hdr.cells[i]; run = c.paragraphs[0].add_run(txt)
+        run.bold = True; run.font.size = Pt(10); run.font.color.rgb = RGBColor.from_string("FFFFFF")
+        shade(c, ACCENT)
+    trPr = hdr._tr.get_or_add_trPr(); th = OxmlElement('w:tblHeader'); th.set(qn('w:val'), 'true'); trPr.append(th)
+
+    for nums, text in placeholders:
+        parts = text.split(" | ")
+        row = table.add_row()
+        # col 1: bold [[REF ...]]
+        p = row.cells[0].paragraphs[0]
+        br = p.add_run("[[REF %s]]" % ", ".join(str(n) for n in nums))
+        br.bold = True; br.font.size = Pt(10); br.font.color.rgb = RGBColor.from_string(ACCENT)
+        shade(row.cells[0], FILL)
+        # col 2: one reference per line, prefixed with its number when aligned
+        cell = row.cells[1]
+        cell.paragraphs[0].text = ""
+        for i, part in enumerate(parts):
+            para = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
+            num = nums[i] if i < len(nums) else "?"
+            nrun = para.add_run("%s  " % num); nrun.bold = True; nrun.font.size = Pt(9.5)
+            nrun.font.color.rgb = RGBColor.from_string(ACCENT)
+            trun = para.add_run(part); trun.font.size = Pt(9.5)
+
+    widths = [Inches(1.6), Inches(5.4)]
+    table.autofit = False; table.allow_autofit = False
+    for rw in table.rows:
+        for i, w in enumerate(widths):
+            rw.cells[i].width = w
+
+    buf = _io.BytesIO(); doc.save(buf)
+    # fix python-docx zoom (schema-required percent)
+    import zipfile
+    zin = zipfile.ZipFile(_io.BytesIO(buf.getvalue())); out = _io.BytesIO()
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for it in zin.infolist():
+            d = zin.read(it.filename)
+            if it.filename == 'word/settings.xml':
+                d = re.sub(rb'<w:zoom[^>]*/>', b'<w:zoom w:percent="100"/>', d)
+            zout.writestr(it, d)
+    return out.getvalue()

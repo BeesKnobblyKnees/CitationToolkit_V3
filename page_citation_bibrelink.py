@@ -11,7 +11,7 @@ import streamlit as st
 import io
 from pathlib import Path
 
-from citation_bibrelink_module import relink, parse_bibliography, index_old_fieldcodes
+from citation_bibrelink_module import relink, parse_bibliography, index_old_fieldcodes, build_placeholders_docx
 
 if "br" not in st.session_state:
     st.session_state.br = {"draft": None, "old": None, "fixed": None,
@@ -108,12 +108,18 @@ with t3:
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                            type="primary", key="br_dl")
         if br["phs"]:
+            ph_docx = build_placeholders_docx(br["phs"])
+            st.download_button("Download placeholder list (.docx)",
+                               data=ph_docx,
+                               file_name=base + "_placeholders.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                               key="br_dl_ph")
             lines = ["CITATION PLACEHOLDERS TO INSERT", "=" * 50, ""]
             for nums, text in br["phs"]:
                 lines.append(f"[[REF {','.join(str(n) for n in nums)}]]  ->  {text}")
             st.download_button("Download placeholder list (.txt)",
                                data="\n".join(lines).encode("utf-8"),
                                file_name=base + "_placeholders.txt",
-                               mime="text/plain", key="br_dl_ph")
+                               mime="text/plain", key="br_dl_ph_txt")
         st.caption("After downloading: open in Word with EndNote, Update Citations "
                    "and Bibliography, then insert the placeholders listed above.")
