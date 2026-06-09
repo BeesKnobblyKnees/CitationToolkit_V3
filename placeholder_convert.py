@@ -2,22 +2,22 @@
 placeholder_convert.py  --  turn citation placeholders into EndNote temporary
 citations ({Author, Year #RecNum}) by resolving them against an .enlx library.
 
-Two placeholder kinds, both handled in one pass:
-  * Green/typed author-year citations  (e.g. "(Hodgen JT 1920 Arch Surg)")
-        -> matched to the library by author + year (+ journal hint).
-  * [[REF n, n, n]] markers from Bibliography Relink
-        -> each number resolved via the document's numbered bibliography
-           (number -> author/year) and then matched to the library.
+Placeholder kinds:
+  * Typed author-year citations, detected either by HIGHLIGHT (a colored marker
+    tells the app "this is a citation") or by PATTERN (any "(... 4-digit-year ...)"
+    parenthesis). Pattern mode needs no highlighting but only touches a parenthesis
+    when at least one reference inside it resolves to the library, so ordinary
+    asides like "(termed rebound deformity)" or "(see 2019 update)" are left alone.
+  * [[REF n, n, n]] markers (no highlight needed; found by text pattern), each
+    number resolved via a numbered reference list (number -> author/year).
 
-Output is ready for EndNote: open in Word with the SAME library selected and run
-Update Citations and Bibliography (or feed it to citation_rebuild). The produced
-{Author, Year #RecNum} record numbers are those of the supplied .enlx.
-
-Confident (exact-year) matches are applied automatically. Matches where only the
-surname lines up (different year/journal) are reported as SUGGESTIONS and are not
-applied unless apply_near=True. Anything unresolved is left in place and flagged.
+Output states (per reference):
+  * applied    -> {Author, Year #RecNum}, no highlight
+  * suggested  -> surname matched but year/journal differs; original text kept on
+                  an ORANGE background, not auto-applied unless apply_near=True
+  * unresolved -> not in the library; original text kept on a RED background
 """
-import io, re, zipfile, sqlite3, difflib, html
+import io, re, zipfile, sqlite3, difflib, html, copy
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.oxml.ns import qn
@@ -28,10 +28,13 @@ try:
 except Exception:
     parse_bibliography = None
 
+ORANGE = "FFC000"   # suggested
+RED = "FF5B5B"      # unresolved
+_CITE_RE = re.compile(r'\(([^()]*\b(?:18|19|20)\d{2}\b[^()]*)\)')
+
 
 # ── library ────────────────────────────────────────────────────────────────
 def load_library(enlx_bytes):
-    """Read refs (id, author, year, title, journal) from an .enlx (zip w/ SQLite)."""
     zf = zipfile.ZipFile(io.BytesIO(enlx_bytes))
     eni = next((n for n in zf.namelist() if n.endswith('sdb.eni')), None)
     if not eni:
@@ -55,16 +58,13 @@ def load_library(enlx_bytes):
 
 
 def match_to_library(surname, year, journal_hint, lib):
-    """Return (record|None, score, kind) where kind in {'exact','near','none'}."""
     sl = (surname or '').lower()
-    jh = (journal_hint or '')
-    jtoks = [t.lower() for t in re.findall(r'[A-Z][a-z]{2,}', jh)]
+    jtoks = [t.lower() for t in re.findall(r'[A-Z][a-z]{2,}', journal_hint or '')]
     def jbonus(r):
         return 0.3 if jtoks and any(t in r['jour'].lower() for t in jtoks) else 0.0
-    # exact year
     best = None
     for r in lib:
-        if r['year'] != year or not year:
+        if not year or r['year'] != year:
             continue
         ratio = difflib.SequenceMatcher(None, sl, r['surl']).ratio()
         starts = bool(sl) and (r['surl'].startswith(sl[:4]) or sl.startswith(r['surl'][:4]))
@@ -73,7 +73,6 @@ def match_to_library(surname, year, journal_hint, lib):
             best = (score, r)
     if best:
         return best[1], best[0], 'exact'
-    # near: surname matches strongly, any year
     near = None
     for r in lib:
         ratio = difflib.SequenceMatcher(None, sl, r['surl']).ratio()
@@ -92,7 +91,6 @@ def _token(rec):
 
 
 def _parse_ref_text(text):
-    """Green typed ref -> (surname, year, journal_hint)."""
     s = text.strip().lstrip('.').lstrip('(').strip()
     ym = re.search(r'\b(?:18|19|20)\d{2}\b', s)
     year = ym.group(0) if ym else ''
@@ -109,12 +107,53 @@ def _is_green(run, color='GREEN'):
         return False
 
 
+def _has_shd(run):
+    rpr = run._r.find(qn('w:rPr'))
+    return rpr is not None and rpr.find(qn('w:shd')) is not None
+
+
+def _shade_run(run, fill):
+    rpr = run._r.get_or_add_rPr()
+    for old in rpr.findall(qn('w:shd')):
+        rpr.remove(old)
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear'); shd.set(qn('w:color'), 'auto'); shd.set(qn('w:fill'), fill)
+    rpr.append(shd)
+
+
+def _new_like(paragraph, ref_run, text, fill=None):
+    """New run that inherits ref_run's font (minus highlight/shading), optional fill."""
+    nr = paragraph.add_run(text)
+    nr.font.highlight_color = None
+    src = ref_run._r.find(qn('w:rPr'))
+    if src is not None:
+        ex = nr._r.find(qn('w:rPr'))
+        if ex is not None:
+            nr._r.remove(ex)
+        clone = copy.deepcopy(src)
+        for tag in ('w:highlight', 'w:shd'):
+            for e in clone.findall(qn(tag)):
+                clone.remove(e)
+        nr._r.insert(0, clone)
+    if fill:
+        _shade_run(nr, fill)
+    return nr
+
+
+def _insert_like(paragraph, after_r, ref_run, text, fill=None):
+    nr = _new_like(paragraph, ref_run, text, fill)
+    after_r.addnext(nr._r)
+    return nr._r
+
+
 # ── conversion ───────────────────────────────────────────────────────────── #
 def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
-            highlight='GREEN', apply_near=False, bib_source_bytes=None):
+            highlight='GREEN', apply_near=False, bib_source_bytes=None,
+            typed_detect='highlight'):
+    """typed_detect in {'highlight','pattern','both'} controls how typed
+    citations are found (only relevant when do_green=True)."""
     lib = load_library(enlx_bytes)
-    bib = {}
-    bibtext = {}
+    bib, bibtext = {}, {}
     if do_refmarkers and parse_bibliography is not None:
         try:
             bib, bibtext = parse_bibliography(bib_source_bytes or docx_bytes)
@@ -123,11 +162,30 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
 
     doc = Document(io.BytesIO(docx_bytes))
     report = []
+    use_hl = do_green and typed_detect in ('highlight', 'both')
+    use_pat = do_green and typed_detect in ('pattern', 'both')
 
-    def resolve(surname, year, hint):
+    def classify(key, surname, year, hint):
         rec, score, kind = match_to_library(surname, year, hint, lib)
-        return rec, kind
+        if rec and (kind == 'exact' or (kind == 'near' and apply_near)):
+            return 'resolved', (key, rec)
+        if rec and kind == 'near':
+            return 'suggested', (key, rec)
+        return 'missing', (key, None)
 
+    def split_refs(text):
+        resolved, suggested, missing = [], [], []
+        bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
+        for piece in text.split(';'):
+            piece = piece.strip()
+            if not piece or not re.search(r'\d', piece):
+                continue
+            sur, year, hint = _parse_ref_text(piece)
+            state, item = classify(piece, sur, year, hint)
+            bucket[state].append(item)
+        return resolved, suggested, missing
+
+    # ---- pass 1: [[REF]] markers + highlighted typed citations ----
     for para in doc.paragraphs:
         runs = para.runs
         n = len(runs)
@@ -136,38 +194,37 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
             run = runs[i]
             txt = run.text or ''
 
-            # ---- [[REF n, n, ...]] marker (single run) ----
             if do_refmarkers and '[[REF' in txt:
                 m = re.search(r'\[\[REF\s*([\d,\s]+)\]\]', txt)
                 if m:
                     nums = [int(x) for x in re.findall(r'\d+', m.group(1))]
-                    resolved, near, unresolved = [], [], []
+                    resolved, suggested, missing = [], [], []
+                    bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
                     for num in nums:
-                        sy = bib.get(num)
-                        hint = bibtext.get(num, '')
+                        sy = bib.get(num); hint = bibtext.get(num, '')
                         if not sy:
-                            unresolved.append((num, None)); continue
-                        rec, kind = resolve(sy[0], sy[1], hint)
-                        if rec and (kind == 'exact' or (kind == 'near' and apply_near)):
-                            resolved.append((num, rec))
-                        elif rec and kind == 'near':
-                            near.append((num, rec)); unresolved.append((num, rec))
-                        else:
-                            unresolved.append((num, None))
+                            missing.append((num, None)); continue
+                        state, item = classify(num, sy[0], sy[1], hint)
+                        bucket[state].append(item)
                     report.append({'kind': 'refmarker', 'orig': m.group(0),
-                                   'resolved': resolved, 'near': near, 'unresolved': unresolved})
-                    if resolved:
-                        cite = '{' + '; '.join(_token(r) for _, r in resolved) + '}'
-                        leftover = [num for num, _ in unresolved]
-                        tail = (' [[REF %s]]' % ', '.join(str(x) for x in leftover)) if leftover else ''
-                        run.text = txt[:m.start()] + cite + tail + txt[m.end():]
-                        if not leftover:
-                            run.font.highlight_color = None
+                                   'resolved': resolved, 'suggested': suggested, 'missing': missing})
+                    prefix, suffix = txt[:m.start()], txt[m.end():]
+                    cite = ('{' + '; '.join(_token(r) for _, r in resolved) + '}') if resolved else ''
+                    run.text = prefix + cite
+                    run.font.highlight_color = None
+                    anchor = run._r
+                    if suggested:
+                        anchor = _insert_like(para, anchor, run,
+                            (' ' if cite else '') + '[[REF %s]]' % ', '.join(str(k) for k, _ in suggested), ORANGE)
+                    if missing:
+                        anchor = _insert_like(para, anchor, run,
+                            (' ' if (cite or suggested) else '') + '[[REF %s]]' % ', '.join(str(k) for k, _ in missing), RED)
+                    if suffix:
+                        _insert_like(para, anchor, run, suffix, None)
                     i += 1
                     continue
 
-            # ---- green typed citation cluster ----
-            if do_green and _is_green(run, highlight):
+            if use_hl and _is_green(run, highlight):
                 members = [i]; j = i + 1
                 while j < n:
                     if _is_green(runs[j], highlight):
@@ -179,43 +236,69 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 green_text = ''.join(runs[k].text for k in members)
                 lead = re.match(r'^([.\s]*)', green_text).group(1)
                 body = green_text[len(lead):].lstrip('(').rstrip().rstrip(')').rstrip()
-                resolved, near, unresolved = [], [], []
-                for piece in body.split(';'):
-                    piece = piece.strip()
-                    if not piece or not re.search(r'\d', piece):
-                        continue
-                    sur, year, hint = _parse_ref_text(piece)
-                    rec, kind = resolve(sur, year, hint)
-                    if rec and (kind == 'exact' or (kind == 'near' and apply_near)):
-                        resolved.append((piece, rec))
-                    elif rec and kind == 'near':
-                        near.append((piece, rec)); unresolved.append((piece, rec))
-                    else:
-                        unresolved.append((piece, None))
+                resolved, suggested, missing = split_refs(body)
                 report.append({'kind': 'green', 'orig': green_text.strip(),
-                               'resolved': resolved, 'near': near, 'unresolved': unresolved})
-                if resolved:
-                    cite = '{' + '; '.join(_token(r) for _, r in resolved) + '}'
-                    leftover_txt = '; '.join(p for p, _ in unresolved)
-                    repl = lead + cite + ((' (' + leftover_txt + ')') if leftover_txt else '')
-                    # strip wrapping parens from neighbours
-                    first = members[0]
-                    if first - 1 >= 0 and (runs[first - 1].text or '').rstrip().endswith('('):
-                        pt = runs[first - 1].text
-                        runs[first - 1].text = pt[:pt.rstrip().rfind('(')]
-                    last = members[-1]
-                    if last + 1 < n and (runs[last + 1].text or '').lstrip().startswith(')'):
-                        ft = runs[last + 1].text; pos = ft.find(')')
-                        runs[last + 1].text = ft[:pos] + ft[pos + 1:]
-                    runs[members[0]].text = repl
-                    runs[members[0]].font.highlight_color = None
-                    for k in members[1:]:
-                        runs[k].text = ''
-                        runs[k].font.highlight_color = None
+                               'resolved': resolved, 'suggested': suggested, 'missing': missing})
+                first, last = members[0], members[-1]
+                if first - 1 >= 0 and (runs[first - 1].text or '').rstrip().endswith('('):
+                    pt = runs[first - 1].text
+                    runs[first - 1].text = pt[:pt.rstrip().rfind('(')]
+                if last + 1 < n and (runs[last + 1].text or '').lstrip().startswith(')'):
+                    ft = runs[last + 1].text; pos = ft.find(')')
+                    runs[last + 1].text = ft[:pos] + ft[pos + 1:]
+                cite = ('{' + '; '.join(_token(r) for _, r in resolved) + '}') if resolved else ''
+                ref_run = runs[members[0]]
+                ref_run.text = lead + cite
+                ref_run.font.highlight_color = None
+                for k in members[1:]:
+                    runs[k].text = ''
+                    runs[k].font.highlight_color = None
+                anchor = ref_run._r
+                if suggested:
+                    anchor = _insert_like(para, anchor, ref_run,
+                        ((' ' if cite else '') + '(' + '; '.join(k for k, _ in suggested) + ')'), ORANGE)
+                if missing:
+                    anchor = _insert_like(para, anchor, ref_run,
+                        ((' ' if (cite or suggested) else '') + '(' + '; '.join(k for k, _ in missing) + ')'), RED)
                 i = j
                 continue
 
             i += 1
+
+    # ---- pass 2: pattern-detected typed citations (no highlight) ----
+    if use_pat:
+        for para in doc.paragraphs:
+            for run in list(para.runs):
+                t = run.text or ''
+                if not t or '[[REF' in t or ('{' in t and '#' in t) or _has_shd(run):
+                    continue
+                matches = list(_CITE_RE.finditer(t))
+                if not matches:
+                    continue
+                segs = []; pos = 0; touched = False
+                for mt in matches:
+                    resolved, suggested, missing = split_refs(mt.group(1))
+                    if not (resolved or suggested):
+                        continue  # not a recognizable citation -> leave it in place
+                    touched = True
+                    report.append({'kind': 'pattern', 'orig': mt.group(0),
+                                   'resolved': resolved, 'suggested': suggested, 'missing': missing})
+                    segs.append(('plain', t[pos:mt.start()]))
+                    if resolved:
+                        segs.append(('plain', '{' + '; '.join(_token(r) for _, r in resolved) + '}'))
+                    if suggested:
+                        segs.append((ORANGE, (' ' if resolved else '') + '(' + '; '.join(k for k, _ in suggested) + ')'))
+                    if missing:
+                        segs.append((RED, (' ' if (resolved or suggested) else '') + '(' + '; '.join(k for k, _ in missing) + ')'))
+                    pos = mt.end()
+                if not touched:
+                    continue
+                segs.append(('plain', t[pos:]))
+                run.text = segs[0][1]
+                anchor = run._r
+                for fill, segtext in segs[1:]:
+                    anchor = _insert_like(para, anchor, run, segtext,
+                                          None if fill == 'plain' else fill)
 
     buf = io.BytesIO(); doc.save(buf)
     return _fix_zoom(buf.getvalue()), report
@@ -237,9 +320,9 @@ def summarize(report):
     return {
         'placeholders': len(report),
         'resolved_refs': sum(len(r['resolved']) for r in report),
-        'suggested_refs': sum(len(r['near']) for r in report),
-        'unresolved_refs': sum(len([u for u in r['unresolved'] if u[1] is None]) for r in report),
-        'fully_done': sum(1 for r in report if r['resolved'] and not r['unresolved']),
+        'suggested_refs': sum(len(r['suggested']) for r in report),
+        'unresolved_refs': sum(len(r['missing']) for r in report),
+        'fully_done': sum(1 for r in report if r['resolved'] and not (r['suggested'] or r['missing'])),
     }
 
 
@@ -266,12 +349,12 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
     r.bold = True; r.font.size = Pt(16); r.font.color.rgb = RGBColor.from_string(ACCENT)
     sm = summarize(report)
     sp = doc.add_paragraph(); sr = sp.add_run(
-        "%d placeholder(s):  %d reference(s) applied,  %d suggested (not applied),  %d unresolved."
+        "%d placeholder(s):  %d reference(s) applied,  %d suggested (orange),  %d unresolved (red)."
         % (sm['placeholders'], sm['resolved_refs'], sm['suggested_refs'], sm['unresolved_refs']))
     sr.font.size = Pt(9); sr.bold = True
     note = doc.add_paragraph(); nr = note.add_run(
-        "Applied = inserted as {Author, Year #RecNum}. Suggested = surname matched but year/journal "
-        "differs; verify and apply manually (or re-run with 'apply close matches'). Unresolved = add to library.")
+        "Applied = inserted as {Author, Year #RecNum}. Suggested (orange in the document) = surname "
+        "matched but year/journal differs; verify, then accept or fix. Unresolved (red) = add to library.")
     nr.font.size = Pt(8.5); nr.italic = True; nr.font.color.rgb = RGBColor.from_string("666666")
     doc.add_paragraph()
 
@@ -287,20 +370,20 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
         p = tr.cells[0].paragraphs[0]
         run = p.add_run(row['orig'][:90]); run.bold = True; run.font.size = Pt(9.5)
         run.font.color.rgb = RGBColor.from_string(ACCENT); shade(tr.cells[0], FILL)
-        cell = tr.cells[1]; cell.paragraphs[0].text = ""; firstpar = True
-        def line(label, color="000000", bold=False):
-            nonlocal firstpar
-            para = cell.paragraphs[0] if firstpar else cell.add_paragraph(); firstpar = False
-            rr = para.add_run(label); rr.font.size = Pt(9.5); rr.bold = bold
+        cell = tr.cells[1]; cell.paragraphs[0].text = ""; firstpar = [True]
+        def line(text, color="000000", bold=False, fill=None):
+            para = cell.paragraphs[0] if firstpar[0] else cell.add_paragraph(); firstpar[0] = False
+            rr = para.add_run(text); rr.font.size = Pt(9.5); rr.bold = bold
             rr.font.color.rgb = RGBColor.from_string(color)
+            if fill:
+                _shade_run(rr, fill)
         for key, rec in row['resolved']:
-            line("APPLIED  %s  ->  %s, %s #%d  (%s)" % (key, rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "1A6B2A")
-        for key, rec in row['near']:
-            line("SUGGEST  %s  ->  %s, %s #%d  (%s)  [verify]" % (key, rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "8A6D00")
-        for key, rec in row['unresolved']:
-            if rec is None:
-                line("UNRESOLVED  %s  ->  add to library" % key, "8B1A1A", bold=True)
-        if not (row['resolved'] or row['near'] or row['unresolved']):
+            line("APPLIED   %s  \u2192  %s, %s #%d  (%s)" % (key, rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "1A6B2A")
+        for key, rec in row['suggested']:
+            line("SUGGESTED %s  \u2192  %s, %s #%d  (%s)  \u2013 verify" % (key, rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "7A5A00", fill=ORANGE)
+        for key, rec in row['missing']:
+            line("UNRESOLVED  %s  \u2013 add to library" % key, "8B1A1A", bold=True, fill=RED)
+        if not (row['resolved'] or row['suggested'] or row['missing']):
             line("(no references parsed)", "666666")
 
     table.autofit = False; table.allow_autofit = False

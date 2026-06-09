@@ -66,10 +66,26 @@ if do_ref:
                "generated against (usually the draft you ran Bibliography Relink on).")
 
 # ── options ────────────────────────────────────────────────────────────────
+typed_detect = "highlight"
 hl_label = "Green"
 if do_green:
-    hl_label = st.selectbox("Highlight color marking the typed citations", list(HL.keys()),
-                            index=0, key="pe_hl")
+    dmode = st.radio(
+        "How are the typed citations marked?",
+        ["Highlighted (recommended)",
+         "By pattern \u2013 any \u201c(\u2026 Year)\u201d parenthesis, no highlight needed",
+         "Both"],
+        key="pe_detect")
+    typed_detect = {"Highlighted (recommended)": "highlight",
+                    "By pattern \u2013 any \u201c(\u2026 Year)\u201d parenthesis, no highlight needed": "pattern",
+                    "Both": "both"}[dmode]
+    if typed_detect in ("highlight", "both"):
+        hl_label = st.selectbox("Highlight color marking the typed citations",
+                                list(HL.keys()), index=0, key="pe_hl")
+    if typed_detect in ("pattern", "both"):
+        st.caption("Pattern mode scans for any parenthesis containing a 4-digit year, but only "
+                   "converts one when a reference inside it resolves to your library - so plain "
+                   "asides like \u201c(termed rebound deformity)\u201d are left untouched. Skim the "
+                   "orange/red flags afterward to catch the occasional false positive or miss.")
 apply_near = st.checkbox(
     "Also apply close matches where the year/journal differs (otherwise they are only suggested)",
     value=False, key="pe_near")
@@ -88,6 +104,7 @@ if go:
                     doc_up.read(), lib_up.read(),
                     do_green=do_green, do_refmarkers=do_ref,
                     highlight=HL[hl_label], apply_near=apply_near,
+                    typed_detect=typed_detect,
                     bib_source_bytes=(bib_up.read() if (do_ref and not bib_from_doc and bib_up) else None),
                 )
                 report_docx = pc.build_report_docx(report)
@@ -128,8 +145,8 @@ if res:
         rows = []
         for r in report:
             applied = "; ".join("%s #%d" % (rec['sur'], rec['id']) for _, rec in r['resolved'])
-            sugg = "; ".join("%s #%d?" % (rec['sur'], rec['id']) for _, rec in r['near'])
-            miss = "; ".join(str(k) for k, rec in r['unresolved'] if rec is None)
+            sugg = "; ".join("%s #%d?" % (rec['sur'], rec['id']) for _, rec in r['suggested'])
+            miss = "; ".join(str(k) for k, _ in r['missing'])
             rows.append({"Placeholder": r['orig'][:50], "Applied": applied,
                          "Suggested": sugg, "Unresolved": miss})
         st.dataframe(rows, use_container_width=True, hide_index=True)
