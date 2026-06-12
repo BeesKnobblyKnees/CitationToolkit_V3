@@ -108,6 +108,9 @@ if go:
                     bib_source_bytes=(bib_up.read() if (do_ref and not bib_from_doc and bib_up) else None),
                 )
                 report_docx = pc.build_report_docx(report)
+                st.session_state["pe_missing_refs"] = [
+                    str(k) for r in report for k, _ in r.get("missing", [])
+                ]
                 stem = os.path.splitext(doc_up.name)[0]
                 st.session_state["pe_out"] = (out, report_docx, pc.summarize(report),
                                               report, f"{stem}_EndNote_ready.docx",

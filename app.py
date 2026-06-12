@@ -39,6 +39,7 @@ with st.sidebar:
     "citation_verifier":   ("09", "Citation Verifier",     "Check each citation against the text before it (A/B/PubMed)"),
     "citation_listing":   ("10", "Citation List", "In-order list matching EndNote Edit & Manage"),
     "placeholder_convert": ("11", "Placeholder → EndNote", "Resolve placeholders & typed citations to {Author, Year #RecNum} from your library"),
+    "find_refs":           ("13", "Find Missing References", "Look up unresolved refs on CrossRef/PubMed, build importable .enw"),
 }
 
     def _nav(key):
@@ -68,6 +69,7 @@ elif page == "citation_bibrelink":  exec(open("page_citation_bibrelink.py").read
 elif page == "citation_verifier":  exec(open("page_citation_verifier.py").read())
 elif page == "citation_listing":  exec(open("page_citation_listing.py").read())
 elif page == "placeholder_convert":  exec(open("page_placeholder_convert.py").read())
+elif page == "find_refs":            exec(open("page_find_refs.py").read())
 # ── Final expander fix (must be last so it wins the cascade) ──────────────────
 st.markdown("""
 <style>
