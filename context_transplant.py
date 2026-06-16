@@ -13,7 +13,7 @@ TARGET = the working section (broken citations: EndNote INVALID errors, bare
 superscript numbers, [[REF n]] markers). SOURCE = the linked twin with correct
 field codes. Only broken target citations are transplanted by default.
 """
-import io, re, math, zipfile, html, difflib
+import io, re, math, zipfile, html, difflib, base64
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.oxml.ns import qn
@@ -57,6 +57,50 @@ def _block_info(block):
     disp = "".join(_txt(r) for r in re.findall(r"<w:r\b.*?</w:r>", block, re.DOTALL)
                    if "fldChar" not in r and "instrText" not in r)
     return disp.strip(), recnum, invalid
+
+
+def _surname(author):
+    m = re.match(r"^([A-Za-z\-\u00C0-\u017F]+)", (author or "").strip())
+    return m.group(1).lower() if m else ""
+
+
+def _toks(s):
+    return set(re.findall(r"[a-z]{4,}", (s or "").lower()))
+
+
+def _block_identity(block):
+    """Author surname / year / title tokens / journal tokens from a field code's
+    embedded EndNote record. Works even on INVALID codes (the record is intact)."""
+    fd = re.search(r"<w:fldData[^>]*>([\s\S]+?)</w:fldData>", block)
+    if not fd:
+        return None
+    b64 = "".join(fd.group(1).split()); pad = (4 - len(b64) % 4) % 4
+    try:
+        dec = base64.b64decode(b64 + "=" * pad).decode("utf-8", "replace")
+    except Exception:
+        return None
+    au = re.search(r"<Author>([^<]+)</Author>", dec)
+    yr = re.search(r"<Year>(\d{4})</Year>", dec)
+    ti = re.search(r"<title>([^<]*)</title>", dec)
+    jo = re.search(r"<secondary-title>([^<]*)</secondary-title>", dec)
+    if not au:
+        return None
+    return {"sur": _surname(au.group(1)), "year": yr.group(1) if yr else "",
+            "ttoks": _toks(html.unescape(ti.group(1)) if ti else ""),
+            "jtoks": _toks(html.unescape(jo.group(1)) if jo else "")}
+
+
+def _id_bonus(ti, si):
+    """Identity affinity between a target and a source citation, plus the title
+    overlap count (used to tell same-author-same-year siblings apart)."""
+    if not ti or not si or not ti["sur"] or not si["sur"]:
+        return 0.0, 0
+    if ti["sur"] == si["sur"] and ti["year"] and ti["year"] == si["year"]:
+        ov = len(ti["ttoks"] & si["ttoks"])
+        return 0.10 + 0.05 * min(ov, 6), ov
+    if ti["sur"] == si["sur"]:
+        return 0.03, 0
+    return 0.0, 0
 
 
 def tokenize(xml):
@@ -181,6 +225,19 @@ def transplant(target_bytes, source_bytes, threshold=0.4, replace_all=False, fil
 
     # similarity matrix (targets x sources) and best-per-target
     sim = [[_wjacc(tg[5], s[0], idf) for s in sources] for tg in targets]
+
+    # identity affinity: pin same-author-same-year citations to the right source
+    # by title, even when the surrounding wording is nearly identical
+    s_ids = [_block_identity(s[1]) for s in sources]
+    t_ids = [_block_identity(tg[2]) if tg[1] == "field" else None for tg in targets]
+    ovl = [[0] * len(sources) for _ in targets]
+    for i in range(len(targets)):
+        if not t_ids[i]:
+            continue
+        for j in range(len(sources)):
+            b, ov = _id_bonus(t_ids[i], s_ids[j])
+            sim[i][j] += b; ovl[i][j] = ov
+
     best = []
     for i in range(len(targets)):
         bj, br = -1, 0.0
@@ -234,11 +291,23 @@ def transplant(target_bytes, source_bytes, threshold=0.4, replace_all=False, fil
         chosen = accepted.get(i)
         if chosen:
             j, r = chosen
+            # ambiguity check: chosen source shares (surname,year) with another
+            # source and the title didn't clearly separate them
+            ambiguous = False
+            if t_ids[i] and s_ids[j] and s_ids[j]["sur"]:
+                sibs = [jj for jj in range(len(sources))
+                        if s_ids[jj] and s_ids[jj]["sur"] == s_ids[j]["sur"]
+                        and s_ids[jj]["year"] == s_ids[j]["year"]]
+                if len(sibs) > 1:
+                    second_ov = max((ovl[i][jj] for jj in sibs if jj != j), default=0)
+                    if ovl[i][j] - second_ov < 2:
+                        ambiguous = True
             replace_at[tok_i] = sources[j][1]
             report.append({"kind": kind, "target": disp or "(blank)", "context": ctx,
                            "matched": sources[j][2], "recnum": sources[j][3],
-                           "ratio": round(r, 2), "method": method.get(i, "context"),
-                           "status": "transplanted"})
+                           "ratio": round(r, 2),
+                           "method": method.get(i, "context"),
+                           "status": "ambiguous" if ambiguous else "transplanted"})
         else:
             report.append({"kind": kind, "target": disp or "(blank)", "context": ctx,
                            "matched": None, "recnum": None, "ratio": round(best[i][1], 2),
@@ -284,10 +353,12 @@ def _fix_zoom(b):
 
 
 def summarize(report):
+    inserted = [r for r in report if r["status"] in ("transplanted", "ambiguous")]
     return {"citations": len(report),
-            "transplanted": sum(1 for r in report if r["status"] == "transplanted"),
-            "by_context": sum(1 for r in report if r["status"] == "transplanted" and r.get("method") == "context"),
-            "by_position": sum(1 for r in report if r["status"] == "transplanted" and r.get("method") == "position"),
+            "transplanted": len(inserted),
+            "by_context": sum(1 for r in inserted if r.get("method") == "context"),
+            "by_position": sum(1 for r in inserted if r.get("method") == "position"),
+            "ambiguous": sum(1 for r in report if r["status"] == "ambiguous"),
             "unmatched": sum(1 for r in report if r["status"] == "no match")}
 
 
@@ -333,13 +404,19 @@ def build_report_docx(report, title="Context Transplant Report"):
         tr = table.add_row()
         tr.cells[0].paragraphs[0].add_run("\u2026" + row["context"]).font.size = Pt(8.5)
         tr.cells[1].paragraphs[0].add_run(row["target"]).font.size = Pt(8.5)
-        if row["status"] == "transplanted":
+        if row["status"] in ("transplanted", "ambiguous"):
             tr.cells[2].paragraphs[0].add_run("%s  #%s" % (row["matched"], row["recnum"])).font.size = Pt(8.5)
             by_pos = row.get("method") == "position"
+            amb = row["status"] == "ambiguous"
             tcPr = tr.cells[2]._tc.get_or_add_tcPr(); sh = OxmlElement("w:shd")
             sh.set(qn("w:val"), "clear"); sh.set(qn("w:color"), "auto")
-            sh.set(qn("w:fill"), ORANGE if by_pos else GREENBG); tcPr.append(sh)
-            label = ("by position  (%.2f) - verify" % row["ratio"]) if by_pos else ("transplanted  (%.2f)" % row["ratio"])
+            sh.set(qn("w:fill"), ORANGE if (by_pos or amb) else GREENBG); tcPr.append(sh)
+            if amb:
+                label = "same author/year - verify  (%.2f)" % row["ratio"]
+            elif by_pos:
+                label = "by position  (%.2f) - verify" % row["ratio"]
+            else:
+                label = "transplanted  (%.2f)" % row["ratio"]
             tr.cells[3].paragraphs[0].add_run(label).font.size = Pt(8.5)
         else:
             tr.cells[2].paragraphs[0].add_run("(left as-is)").font.size = Pt(8.5)

@@ -45,40 +45,82 @@ def load_library(enlx_bytes):
     tmp.write(raw); tmp.close()
     con = sqlite3.connect(tmp.name); con.row_factory = sqlite3.Row
     def clean(s): return re.sub(r'<[^>]+>', '', s or '').replace('\r', ' / ').replace('\n', ' ').strip()
+    def surnames(au):
+        out = set()
+        for a in au.split(' / '):
+            a = a.strip()
+            if a:
+                s = a.split(',')[0].strip().lower()
+                if len(s) >= 3:
+                    out.add(s)
+        return out
     lib = []
-    for r in con.execute('SELECT id,trash_state,author,year,title,secondary_title FROM refs'):
+    for r in con.execute('SELECT id,trash_state,author,year,title,secondary_title,volume,pages FROM refs'):
         if (r['trash_state'] or 0) != 0:
             continue
         au = clean(r['author']); first = au.split(' / ')[0] if au else ''
         sur = first.split(',')[0].strip()
         lib.append({'id': r['id'], 'sur': sur, 'surl': sur.lower(), 'year': str(r['year'] or ''),
-                    'jour': clean(r['secondary_title']), 'title': clean(r['title'])})
+                    'jour': clean(r['secondary_title']), 'title': clean(r['title']),
+                    'auths': surnames(au),
+                    'vol': str(r['volume'] or '').strip(),
+                    'pages': re.findall(r'\d+', r['pages'] or '')})
     con.close()
     return lib
 
 
-def match_to_library(surname, year, journal_hint, lib):
+def _content_score(rec, hint):
+    """How well a library record's title/journal/co-authors/volume/pages match
+    the full reference text. Used to separate same-author-same-year papers."""
+    hl = (hint or '').lower()
+    htoks = set(re.findall(r'[a-z]{4,}', hl))
+    hnums = set(re.findall(r'\d+', hint or ''))
+    ttoks = set(re.findall(r'[a-z]{4,}', (rec['title'] or '').lower()))
+    jtoks = set(re.findall(r'[a-z]{4,}', (rec['jour'] or '').lower()))
+    t = len(ttoks & htoks)
+    j = len(jtoks & htoks)
+    a = len(rec.get('auths', set()) & htoks)
+    vp = (1 if rec.get('vol') and rec['vol'] in hnums else 0)
+    vp += sum(1 for p in rec.get('pages', []) if p in hnums)
+    return t * 1.0 + j * 1.0 + a * 0.6 + min(vp, 2) * 0.5
+
+
+def match_to_library(surname, year, hint, lib):
     sl = (surname or '').lower()
-    jtoks = [t.lower() for t in re.findall(r'[A-Z][a-z]{2,}', journal_hint or '')]
-    def jbonus(r):
-        return 0.3 if jtoks and any(t in r['jour'].lower() for t in jtoks) else 0.0
-    best = None
+    # candidates: same year, surname close
+    cands = []
     for r in lib:
         if not year or r['year'] != year:
             continue
         ratio = difflib.SequenceMatcher(None, sl, r['surl']).ratio()
         starts = bool(sl) and (r['surl'].startswith(sl[:4]) or sl.startswith(r['surl'][:4]))
-        score = ratio + (0.25 if starts else 0) + jbonus(r)
-        if score >= 0.85 and (best is None or score > best[0]):
-            best = (score, r)
-    if best:
-        return best[1], best[0], 'exact'
+        if ratio >= 0.85 or starts:
+            cands.append(r)
+
+    if len(cands) == 1:
+        return cands[0], 1.0, 'exact'
+
+    if len(cands) > 1:
+        scored = sorted(((_content_score(r, hint), r['id'], r) for r in cands),
+                        key=lambda x: (x[0], -x[1]), reverse=True)
+        top, second = scored[0], scored[1]
+        # confident only with real content signal AND a clear margin
+        if top[0] >= 2.0 and (top[0] - second[0]) >= 1.5:
+            return top[2], top[0], 'exact'
+        # some signal but not decisive -> best guess, flagged for verification
+        if top[0] >= 1.0 and top[0] > second[0]:
+            return top[2], top[0], 'near'
+        # indistinguishable from the hint (e.g. typed citation with no title) -> flag
+        return cands[0], 0.0, 'ambiguous'
+
+    # no same-year candidate -> looser cross-year fallback
     near = None
     for r in lib:
         ratio = difflib.SequenceMatcher(None, sl, r['surl']).ratio()
         starts = bool(sl) and (r['surl'].startswith(sl[:5]) or sl.startswith(r['surl'][:5]))
         if ratio >= 0.8 or starts:
-            score = ratio + (0.2 if starts else 0) + jbonus(r) + 0.2
+            jb = 0.3 if re.search(re.escape(r['surl'][:4]), (hint or '').lower()) else 0.0
+            score = ratio + (0.2 if starts else 0) + 0.2 + jb
             if near is None or score > near[0]:
                 near = (score, r)
     if near and near[0] >= 0.9:
@@ -88,6 +130,20 @@ def match_to_library(surname, year, journal_hint, lib):
 
 def _token(rec):
     return "%s, %s #%d" % (rec['sur'], rec['year'], rec['id'])
+
+
+def _parse_bib_full(b):
+    """num -> full untruncated reference text (for content-based matching)."""
+    full = {}
+    try:
+        doc = Document(io.BytesIO(b))
+    except Exception:
+        return full
+    for p in doc.paragraphs:
+        m = re.match(r'^(\d{1,3})\s+(.*)', (p.text or '').strip())
+        if m and len(m.group(2)) >= 15:
+            full[int(m.group(1))] = m.group(2)
+    return full
 
 
 def _parse_ref_text(text):
@@ -208,11 +264,13 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
     'refmark' ([[REF n]]), 'bracket' ([n]), 'paren' ((n))."""
     lib = load_library(enlx_bytes)
     bib, bibtext = {}, {}
+    bibfull = {}
     if do_refmarkers and parse_bibliography is not None:
         try:
             bib, bibtext = parse_bibliography(bib_source_bytes or docx_bytes)
+            bibfull = _parse_bib_full(bib_source_bytes or docx_bytes)
         except Exception:
-            bib, bibtext = {}, {}
+            bib, bibtext, bibfull = {}, {}, {}
 
     doc = Document(io.BytesIO(docx_bytes))
     report = []
@@ -223,7 +281,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
         rec, score, kind = match_to_library(surname, year, hint, lib)
         if rec and (kind == 'exact' or (kind == 'near' and apply_near)):
             return 'resolved', (key, rec)
-        if rec and kind == 'near':
+        if rec and kind in ('near', 'ambiguous'):
             return 'suggested', (key, rec)
         return 'missing', (key, None)
 
@@ -353,7 +411,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 resolved, suggested, missing = [], [], []
                 bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
                 for num in nums:
-                    sy = bib.get(num); hint = bibtext.get(num, '')
+                    sy = bib.get(num); hint = bibfull.get(num) or bibtext.get(num, '')
                     if not sy:
                         missing.append((num, None)); continue
                     st, item = classify(num, sy[0], sy[1], hint)

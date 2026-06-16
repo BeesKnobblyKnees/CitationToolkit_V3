@@ -84,11 +84,68 @@ def parse_bibliography(draft_bytes):
     return bib, bibtext
 
 
+def _parse_bib_full(b):
+    """num -> full untruncated reference text (for content disambiguation)."""
+    full = {}
+    try:
+        d = docx.Document(io.BytesIO(b))
+    except Exception:
+        return full
+    for p in d.paragraphs:
+        m = re.match(r'^(\d{1,3})\s+(.*)', (p.text or '').strip())
+        if m and len(m.group(2)) >= 15:
+            full[int(m.group(1))] = m.group(2)
+    return full
+
+
+def _toks(s):
+    return set(re.findall(r'[a-z]{4,}', (s or '').lower()))
+
+
+def _cite_content(cite_xml):
+    """Pull title / journal / pages / volume / recnum out of an EN.CITE record
+    so two same-author-same-year cites can be told apart."""
+    def g(tag):
+        m = re.search(r'<%s>([^<]*)</%s>' % (tag, tag), cite_xml)
+        return html.unescape(m.group(1)) if m else ''
+    return {'xml': cite_xml, 'recnum': g('RecNum'),
+            'title': g('title'), 'jour': g('secondary-title') or g('full-title'),
+            'pages': re.findall(r'\d+', g('pages')), 'vol': g('volume').strip()}
+
+
+def _score_cite(cd, hint):
+    htoks = _toks(hint); hnums = set(re.findall(r'\d+', hint or ''))
+    t = len(_toks(cd['title']) & htoks)
+    j = len(_toks(cd['jour']) & htoks)
+    vp = (1 if cd['vol'] and cd['vol'] in hnums else 0) + sum(1 for p in cd['pages'] if p in hnums)
+    return t * 1.0 + j * 1.0 + min(vp, 2) * 0.5
+
+
+def _resolve_cite(key, hint, cites_by_id):
+    """Pick the right old cite for a citation number. Returns (cite_dict, kind).
+    kind 'exact' = confident, 'ambiguous' = indistinguishable (caller flags)."""
+    lst = cites_by_id.get(key, [])
+    if not lst:
+        return None, 'none'
+    if len(lst) == 1:
+        return lst[0], 'exact'
+    scored = sorted(((_score_cite(cd, hint), i, cd) for i, cd in enumerate(lst)),
+                    key=lambda x: x[0], reverse=True)
+    top, second = scored[0], scored[1]
+    if top[0] >= 2.0 and (top[0] - second[0]) >= 1.5:
+        return top[2], 'exact'
+    if top[0] >= 1.0 and top[0] > second[0]:
+        return top[2], 'near'
+    return None, 'ambiguous'
+
+
 def index_old_fieldcodes(old_bytes):
-    """Return (fieldxml_by_set, cite_by_id) from the citation-intact old doc."""
+    """Return (fieldxml_by_set, cites_by_id) from the citation-intact old doc.
+    cites_by_id maps (surname,year) -> list of cite-dicts (one per distinct
+    RecNum), so same-author-same-year papers are kept separate."""
     xml = _docxml(old_bytes)
     runs = re.findall(r"<w:r\b(?:(?!</w:r>).)*?</w:r>", xml, re.DOTALL)
-    fieldxml_by_set, cite_by_id = {}, {}
+    fieldxml_by_set, cites_by_id = {}, {}
     i = 0
     while i < len(runs):
         if 'fldCharType="begin"' in runs[i]:
@@ -111,8 +168,13 @@ def index_old_fieldcodes(old_bytes):
                         if au and yr:
                             s = _surname(au.group(1))
                             if s:
-                                cite_by_id.setdefault((s, yr.group(1)), c)
-                                ids.add((s, yr.group(1)))
+                                key = (s, yr.group(1))
+                                cd = _cite_content(c)
+                                lst = cites_by_id.setdefault(key, [])
+                                if not any(e['recnum'] == cd['recnum'] and cd['recnum'] for e in lst) \
+                                        and not any(e['xml'] == cd['xml'] for e in lst):
+                                    lst.append(cd)
+                                ids.add(key)
                     if ids:
                         fieldxml_by_set.setdefault(frozenset(ids), block)
                 except Exception:
@@ -120,22 +182,28 @@ def index_old_fieldcodes(old_bytes):
             i = j
         else:
             i += 1
-    return fieldxml_by_set, cite_by_id
+    return fieldxml_by_set, cites_by_id
 
 
 def _strip_disp(c):
     return re.sub(r"<DisplayText>.*?</DisplayText>", "", c, flags=re.DOTALL)
 
 
-def _build_fieldcode(nums, bib, cite_by_id, rstyle="citsup", superscript=True):
-    idents = [bib.get(n) for n in nums]
-    if any(x is None or x not in cite_by_id for x in idents):
-        return None
+def _build_fieldcode(nums, bib, cites_by_id, bibfull, rstyle="citsup", superscript=True):
+    chosen = []
+    for n in nums:
+        key = bib.get(n)
+        if key is None:
+            return None
+        cd, kind = _resolve_cite(key, bibfull.get(n, ''), cites_by_id)
+        if cd is None:          # missing or genuinely ambiguous -> placeholder
+            return None
+        chosen.append(cd)
     rpr = '<w:rPr><w:rStyle w:val="%s"/></w:rPr>' % rstyle
     face = "superscript" if superscript else "normal"
     cites = []
-    for k, ident in enumerate(idents):
-        c = cite_by_id[ident]
+    for k, cd in enumerate(chosen):
+        c = cd['xml']
         if k == 0:
             disp = ('<DisplayText><style face="%s">' % face
                     + ", ".join(str(n) for n in nums) + "</style></DisplayText>")
@@ -162,11 +230,14 @@ def _placeholder(nums, rstyle="citsup"):
             + '<w:t xml:space="preserve">[[REF %s]]</w:t></w:r>' % ",".join(str(n) for n in nums))
 
 
-def _scan_replace(xml, bib, bibtext, fieldxml_by_set, cite_by_id, construct,
-                  cite_style, sep_require_style, build_rstyle, build_superscript):
+def _scan_replace(xml, bib, bibtext, fieldxml_by_set, cites_by_id, construct,
+                  cite_style, sep_require_style, build_rstyle, build_superscript,
+                  bibfull=None):
     """Find consecutive cite-styled number runs, replace each group with a real
     field code (exact transplant / assembled) or a placeholder. Returns
     (new_xml, kinds_counter, placeholders, all_nums)."""
+    bibfull = bibfull or {}
+    ambig = {k for k, v in cites_by_id.items() if len(v) > 1}
     runs = re.findall(r"<w:r\b(?:(?!</w:r>).)*?</w:r>", xml, re.DOTALL)
     reps, placeholders, all_nums = [], [], []
     cur, cur_runs, last_num = [], [], -1
@@ -177,10 +248,11 @@ def _scan_replace(xml, bib, bibtext, fieldxml_by_set, cite_by_id, construct,
             span = "".join(cur_runs[:last_num + 1])          # drop trailing separators
             idents = [bib.get(n) for n in cur]
             fs = frozenset(i for i in idents if i)
-            if all(idents) and fs in fieldxml_by_set:
+            # exact whole-block reuse only when no identity is ambiguous
+            if all(idents) and fs in fieldxml_by_set and not (fs & ambig):
                 reps.append((span, fieldxml_by_set[fs], "exact"))
-            elif construct and all(idents) and all(i in cite_by_id for i in idents):
-                fc = _build_fieldcode(cur, bib, cite_by_id, build_rstyle, build_superscript)
+            elif construct and all(idents) and all(i in cites_by_id for i in idents):
+                fc = _build_fieldcode(cur, bib, cites_by_id, bibfull, build_rstyle, build_superscript)
                 if fc:
                     reps.append((span, fc, "constructed"))
                 else:
@@ -210,7 +282,7 @@ def _scan_replace(xml, bib, bibtext, fieldxml_by_set, cite_by_id, construct,
     return out, Counter(k for _, _, k in reps), placeholders, all_nums
 
 
-def _relink_reference_footnotes(foot_xml, bib, bibtext, fieldxml_by_set, cite_by_id, construct):
+def _relink_reference_footnotes(foot_xml, bib, bibtext, fieldxml_by_set, cites_by_id, construct, bibfull=None):
     """Relink only footnotes whose text mentions 'Reference', leaving all other
     footnotes (figure/table cross-refs, editorial notes) untouched."""
     out = foot_xml
@@ -220,9 +292,9 @@ def _relink_reference_footnotes(foot_xml, bib, bibtext, fieldxml_by_set, cite_by
         vis = "".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", block))
         if "Reference" not in vis:
             continue
-        nb, k, p, n = _scan_replace(block, bib, bibtext, fieldxml_by_set, cite_by_id,
+        nb, k, p, n = _scan_replace(block, bib, bibtext, fieldxml_by_set, cites_by_id,
                                     construct, cite_style="crossref", sep_require_style=False,
-                                    build_rstyle="crossref", build_superscript=False)
+                                    build_rstyle="crossref", build_superscript=False, bibfull=bibfull)
         if nb != block:
             out = out.replace(block, nb, 1)
             kinds += k
@@ -238,22 +310,23 @@ def relink(draft_bytes, old_bytes, construct=True, bib_source_bytes=None):
     numbering. Use when the draft is a section that doesn't contain its own
     bibliography - point it at the chapter's master reference list."""
     bib, bibtext = parse_bibliography(bib_source_bytes or draft_bytes)
-    fieldxml_by_set, cite_by_id = index_old_fieldcodes(old_bytes)
+    bibfull = _parse_bib_full(bib_source_bytes or draft_bytes)
+    fieldxml_by_set, cites_by_id = index_old_fieldcodes(old_bytes)
 
     src = zipfile.ZipFile(io.BytesIO(draft_bytes))
     names = set(src.namelist())
 
     body_xml = src.read("word/document.xml").decode("utf-8")
     body_out, body_kinds, body_ph, body_nums = _scan_replace(
-        body_xml, bib, bibtext, fieldxml_by_set, cite_by_id, construct,
+        body_xml, bib, bibtext, fieldxml_by_set, cites_by_id, construct,
         cite_style="citsup", sep_require_style=True,
-        build_rstyle="citsup", build_superscript=True)
+        build_rstyle="citsup", build_superscript=True, bibfull=bibfull)
 
     foot_out, foot_kinds, foot_ph, foot_nums = None, Counter(), [], []
     if "word/footnotes.xml" in names:
         foot_xml = src.read("word/footnotes.xml").decode("utf-8")
         foot_out, foot_kinds, foot_ph, foot_nums = _relink_reference_footnotes(
-            foot_xml, bib, bibtext, fieldxml_by_set, cite_by_id, construct)
+            foot_xml, bib, bibtext, fieldxml_by_set, cites_by_id, construct, bibfull=bibfull)
         if foot_out == foot_xml:
             foot_out = None  # nothing changed; keep original part verbatim
 
