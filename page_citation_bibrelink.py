@@ -15,7 +15,8 @@ from citation_bibrelink_module import relink, parse_bibliography, index_old_fiel
 
 if "br" not in st.session_state:
     st.session_state.br = {"draft": None, "old": None, "fixed": None,
-                           "report": None, "phs": None, "draft_name": None}
+                           "report": None, "phs": None, "draft_name": None,
+                           "bib_src": None}
 br = st.session_state.br
 
 st.title("Bibliography Relink")
@@ -42,22 +43,46 @@ with t1:
         up_o = st.file_uploader("Old document", type=["docx"], key="br_old")
         if up_o:
             br["old"] = up_o.read(); st.success(f"Loaded {up_o.name}")
+
+    st.markdown("**Reference list source** — where the citation *numbers* are defined")
+    src_mode = st.radio(
+        "Reference list source",
+        ["Whole chapter - the edited draft contains its own numbered bibliography",
+         "A section - use a separate reference list I upload"],
+        key="br_bibsrc", label_visibility="collapsed")
+    if src_mode.startswith("A section"):
+        up_b = st.file_uploader("Chapter's numbered reference list (.docx)", type=["docx"], key="br_bibfile")
+        if up_b:
+            br["bib_src"] = up_b.read(); st.success(f"Loaded reference list: {up_b.name}")
+        st.caption("Point this at the chapter's MASTER numbered reference list. The draft's "
+                   "superscript numbers are resolved against it, so a cut-out section that has no "
+                   "bibliography of its own can still be relinked. Use the chapter's real numbering, "
+                   "not a section's locally regenerated 1-N list.")
+    else:
+        br["bib_src"] = None
+
     if not (br["draft"] and br["old"]):
         st.warning("Upload both documents to continue.")
+    elif src_mode.startswith("A section") and not br["bib_src"]:
+        st.warning("Section mode: upload the chapter's reference list, or switch to whole-chapter mode.")
 
 with t2:
     if not (br["draft"] and br["old"]):
         st.warning("Upload both documents in tab 1 first.")
     else:
         if st.button("Analyse", key="br_analyse"):
-            bib, bibtext = parse_bibliography(br["draft"])
+            bib, bibtext = parse_bibliography(br["bib_src"] or br["draft"])
             fbs, cbi = index_old_fieldcodes(br["old"])
             st.session_state.br["_preview"] = (len(bibtext), len(fbs), len(cbi))
         prev = st.session_state.br.get("_preview")
         if prev:
-            st.write(f"Draft bibliography entries: **{prev[0]}** · "
+            st.write(f"Reference list entries: **{prev[0]}** · "
                      f"old-doc citation groups: **{prev[1]}** · "
                      f"unique reference records available: **{prev[2]}**")
+            if prev[0] == 0:
+                st.warning("No numbered reference list found. If this draft is a section, "
+                           "switch to section mode in tab 1 and upload the chapter's list - "
+                           "otherwise every citation becomes a [[REF #]] placeholder.")
 
         construct = st.checkbox(
             "Assemble field codes for partial matches (max coverage). "
@@ -66,7 +91,8 @@ with t2:
 
         if st.button("Relink", type="primary", key="br_relink"):
             with st.spinner("Resolving citations and building field codes…"):
-                fixed, report, phs = relink(br["draft"], br["old"], construct=construct)
+                fixed, report, phs = relink(br["draft"], br["old"], construct=construct,
+                                            bib_source_bytes=br["bib_src"])
                 br["fixed"], br["report"], br["phs"] = fixed, report, phs
 
         if br["report"]:

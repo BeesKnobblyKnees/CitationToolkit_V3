@@ -23,11 +23,12 @@ if "pe_out" not in st.session_state:
     st.session_state["pe_out"] = None
 
 M_TYPED = "Typed / green-highlighted citations"
-M_REF = "[[REF #]] markers (from Bibliography Relink)"
+M_REF = "Numbered markers  [[REF #]] · [#] · (#)"
 M_BOTH = "Both"
 
 HL = {"Green": "GREEN", "Bright green": "BRIGHT_GREEN", "Yellow": "YELLOW",
       "Turquoise": "TURQUOISE", "Pink": "PINK"}
+STYLE = {"[[REF #]]": "refmark", "[#]": "bracket", "(#)": "paren"}
 
 st.markdown("## Placeholder \u2192 EndNote")
 st.markdown(
@@ -48,11 +49,20 @@ with c1:
 with c2:
     lib_up = st.file_uploader("EndNote library (.enlx)", type=["enlx"], key="pe_lib")
 
-# ── [[REF #]] reference-list source ────────────────────────────────────────
+# ── numbered-marker styles + reference-list source ─────────────────────────
 bib_up = None
 bib_from_doc = True
+ref_styles = ('refmark',)
 if do_ref:
-    st.markdown("**Where do the `[[REF #]]` numbers come from?**")
+    picks = st.multiselect(
+        "Which numbered markers should I detect?",
+        list(STYLE.keys()), default=["[[REF #]]"], key="pe_styles")
+    ref_styles = tuple(STYLE[p] for p in picks)
+    if any(s in ("[#]", "(#)") for s in picks):
+        st.caption("`[#]` and `(#)` are only converted when the number is actually in the "
+                   "reference list, so stray items like `(99)` or an enumeration are left alone. "
+                   "`(#)` is the riskier one - enable it only if your citations really use parentheses.")
+    st.markdown("**Where do the citation numbers come from?**")
     src = st.radio(
         "Reference-list source",
         ["This document's own numbered reference list",
@@ -61,9 +71,8 @@ if do_ref:
     bib_from_doc = src.startswith("This document")
     if not bib_from_doc:
         bib_up = st.file_uploader("Numbered reference list (.docx)", type=["docx"], key="pe_bib")
-    st.caption("`[[REF #]]` numbers are reference-list **positions** - they shift when "
-               "references are added or removed. Pin the exact list those numbers were "
-               "generated against (usually the draft you ran Bibliography Relink on).")
+    st.caption("The numbers are reference-list **positions** - pin the exact list those numbers "
+               "were generated against (the numbered bibliography at the bottom of the chapter).")
 
 # ── options ────────────────────────────────────────────────────────────────
 typed_detect = "highlight"
@@ -97,6 +106,8 @@ if go:
         st.warning("Upload both the document and the .enlx library.")
     elif do_ref and not bib_from_doc and not bib_up:
         st.warning("Upload the numbered reference list, or switch to using the document's own list.")
+    elif do_ref and not ref_styles:
+        st.warning("Pick at least one numbered-marker style to detect ([[REF #]], [#], or (#)).")
     else:
         try:
             with st.spinner("Matching against the library\u2026"):
@@ -104,13 +115,10 @@ if go:
                     doc_up.read(), lib_up.read(),
                     do_green=do_green, do_refmarkers=do_ref,
                     highlight=HL[hl_label], apply_near=apply_near,
-                    typed_detect=typed_detect,
+                    typed_detect=typed_detect, ref_styles=ref_styles,
                     bib_source_bytes=(bib_up.read() if (do_ref and not bib_from_doc and bib_up) else None),
                 )
                 report_docx = pc.build_report_docx(report)
-                st.session_state["pe_missing_refs"] = [
-                    str(k) for r in report for k, _ in r.get("missing", [])
-                ]
                 stem = os.path.splitext(doc_up.name)[0]
                 st.session_state["pe_out"] = (out, report_docx, pc.summarize(report),
                                               report, f"{stem}_EndNote_ready.docx",
@@ -122,7 +130,7 @@ res = st.session_state.get("pe_out")
 if res:
     out, report_docx, sm, report, out_name, rep_name, was_ref = res
     if was_ref and sm["placeholders"] and sm["resolved_refs"] == 0 and sm["unresolved_refs"]:
-        st.warning("No `[[REF #]]` numbers resolved - the chosen reference list may not match "
+        st.warning("No numbered markers resolved - the chosen reference list may not match "
                    "these markers (or has no numbered entries). Check the source list.")
     m = st.columns(4)
     m[0].metric("Placeholders", sm["placeholders"])

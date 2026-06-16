@@ -231,9 +231,13 @@ def _relink_reference_footnotes(foot_xml, bib, bibtext, fieldxml_by_set, cite_by
     return out, kinds, phs, nums
 
 
-def relink(draft_bytes, old_bytes, construct=True):
-    """Return (fixed_bytes, report, placeholders[list of (numbers, ref_text)])."""
-    bib, bibtext = parse_bibliography(draft_bytes)
+def relink(draft_bytes, old_bytes, construct=True, bib_source_bytes=None):
+    """Return (fixed_bytes, report, placeholders[list of (numbers, ref_text)]).
+
+    bib_source_bytes: optional .docx whose numbered reference list supplies the
+    numbering. Use when the draft is a section that doesn't contain its own
+    bibliography - point it at the chapter's master reference list."""
+    bib, bibtext = parse_bibliography(bib_source_bytes or draft_bytes)
     fieldxml_by_set, cite_by_id = index_old_fieldcodes(old_bytes)
 
     src = zipfile.ZipFile(io.BytesIO(draft_bytes))

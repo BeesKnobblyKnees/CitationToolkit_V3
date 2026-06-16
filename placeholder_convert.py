@@ -146,12 +146,66 @@ def _insert_like(paragraph, after_r, ref_run, text, fill=None):
     return nr._r
 
 
+# ── numbered citation markers: [[REF n]] / [n] / (n) ──────────────────────── #
+_NUM_PAT = {
+    'refmark': re.compile(r'\[\[REF\s*([\d,\s\u2013-]+)\]\]'),
+    'bracket': re.compile(r'\[\s*(\d{1,3}(?:\s*[,\u2013-]\s*\d{1,3})*)\s*\]'),
+    'paren':   re.compile(r'\(\s*(\d{1,3}(?:\s*[,\u2013-]\s*\d{1,3})*)\s*\)'),
+}
+_FMT = {'refmark': '[[REF %s]]', 'bracket': '[%s]', 'paren': '(%s)'}
+
+
+def _expand_nums(inner):
+    out = []
+    for part in re.split(r'\s*,\s*', inner.strip()):
+        rng = re.match(r'(\d+)\s*[\u2013-]\s*(\d+)$', part)
+        if rng:
+            out += list(range(int(rng.group(1)), int(rng.group(2)) + 1))
+        elif part.isdigit():
+            out.append(int(part))
+    return out
+
+
+def _fmt_marker(style, nums):
+    return _FMT[style] % ', '.join(str(n) for n in nums)
+
+
+def _splice_marker(para, s, e, segments):
+    """Replace the [s,e) span of a paragraph's text (which may cross runs) with
+    the given (text, fill) segments, preserving surrounding runs/formatting."""
+    runs = para.runs
+    texts = [r.text or '' for r in runs]
+    pos, spans = 0, []
+    for t in texts:
+        spans.append((pos, pos + len(t))); pos += len(t)
+    ri_s = next((ri for ri, (a, b) in enumerate(spans) if a <= s < b), None)
+    ri_e = next((ri for ri, (a, b) in enumerate(spans) if a < e <= b), None)
+    if ri_s is None or ri_e is None:
+        return
+    prefix = texts[ri_s][:s - spans[ri_s][0]]
+    suffix = texts[ri_e][e - spans[ri_e][0]:]
+    ref = runs[ri_s]
+    runs[ri_s].text = prefix
+    runs[ri_s].font.highlight_color = None
+    for ri in range(ri_s + 1, ri_e + 1):
+        runs[ri].text = ''
+    anchor = runs[ri_s]._r
+    for segtext, fill in segments:
+        if segtext == '':
+            continue
+        anchor = _insert_like(para, anchor, ref, segtext, fill)
+    if suffix:
+        _insert_like(para, anchor, ref, suffix, None)
+
+
 # ── conversion ───────────────────────────────────────────────────────────── #
 def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
             highlight='GREEN', apply_near=False, bib_source_bytes=None,
-            typed_detect='highlight'):
+            typed_detect='highlight', ref_styles=('refmark',)):
     """typed_detect in {'highlight','pattern','both'} controls how typed
-    citations are found (only relevant when do_green=True)."""
+    citations are found (only relevant when do_green=True).
+    ref_styles selects which numbered markers to detect: any of
+    'refmark' ([[REF n]]), 'bracket' ([n]), 'paren' ((n))."""
     lib = load_library(enlx_bytes)
     bib, bibtext = {}, {}
     if do_refmarkers and parse_bibliography is not None:
@@ -185,7 +239,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
             bucket[state].append(item)
         return resolved, suggested, missing
 
-    # ---- pass 1: [[REF]] markers + highlighted typed citations ----
+    # ---- pass 1: highlighted typed citations ----
     for para in doc.paragraphs:
         runs = para.runs
         n = len(runs)
@@ -193,36 +247,6 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
         while i < n:
             run = runs[i]
             txt = run.text or ''
-
-            if do_refmarkers and '[[REF' in txt:
-                m = re.search(r'\[\[REF\s*([\d,\s]+)\]\]', txt)
-                if m:
-                    nums = [int(x) for x in re.findall(r'\d+', m.group(1))]
-                    resolved, suggested, missing = [], [], []
-                    bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
-                    for num in nums:
-                        sy = bib.get(num); hint = bibtext.get(num, '')
-                        if not sy:
-                            missing.append((num, None)); continue
-                        state, item = classify(num, sy[0], sy[1], hint)
-                        bucket[state].append(item)
-                    report.append({'kind': 'refmarker', 'orig': m.group(0),
-                                   'resolved': resolved, 'suggested': suggested, 'missing': missing})
-                    prefix, suffix = txt[:m.start()], txt[m.end():]
-                    cite = ('{' + '; '.join(_token(r) for _, r in resolved) + '}') if resolved else ''
-                    run.text = prefix + cite
-                    run.font.highlight_color = None
-                    anchor = run._r
-                    if suggested:
-                        anchor = _insert_like(para, anchor, run,
-                            (' ' if cite else '') + '[[REF %s]]' % ', '.join(str(k) for k, _ in suggested), ORANGE)
-                    if missing:
-                        anchor = _insert_like(para, anchor, run,
-                            (' ' if (cite or suggested) else '') + '[[REF %s]]' % ', '.join(str(k) for k, _ in missing), RED)
-                    if suffix:
-                        _insert_like(para, anchor, run, suffix, None)
-                    i += 1
-                    continue
 
             if use_hl and _is_green(run, highlight):
                 members = [i]; j = i + 1
@@ -299,6 +323,54 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 for fill, segtext in segs[1:]:
                     anchor = _insert_like(para, anchor, run, segtext,
                                           None if fill == 'plain' else fill)
+
+    # ---- pass 3: numbered markers  [[REF n]] / [n] / (n) ----
+    if do_refmarkers and ref_styles:
+        pats = [(s, _NUM_PAT[s]) for s in ref_styles if s in _NUM_PAT]
+        for para in doc.paragraphs:
+            full = ''.join(r.text or '' for r in para.runs)
+            if not full:
+                continue
+            found = []
+            for style, pat in pats:
+                for m in pat.finditer(full):
+                    found.append((m.start(), m.end(), style, m.group(1)))
+            if not found:
+                continue
+            found.sort()
+            chosen, last_end = [], -1
+            for s, e, style, inner in found:
+                if s >= last_end:
+                    chosen.append((s, e, style, inner)); last_end = e
+            actions = []
+            for s, e, style, inner in chosen:
+                nums = _expand_nums(inner)
+                if not nums:
+                    continue
+                in_bib = any(bib.get(num) is not None for num in nums)
+                if style != 'refmark' and not in_bib:
+                    continue  # bracketed/parenthesised number that isn't a reference
+                resolved, suggested, missing = [], [], []
+                bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
+                for num in nums:
+                    sy = bib.get(num); hint = bibtext.get(num, '')
+                    if not sy:
+                        missing.append((num, None)); continue
+                    st, item = classify(num, sy[0], sy[1], hint)
+                    bucket[st].append(item)
+                report.append({'kind': style, 'orig': full[s:e],
+                               'resolved': resolved, 'suggested': suggested, 'missing': missing})
+                cite = ('{' + '; '.join(_token(r) for _, r in resolved) + '}') if resolved else ''
+                segs = []
+                if cite:
+                    segs.append((cite, None))
+                if suggested:
+                    segs.append(((' ' if cite else '') + _fmt_marker(style, [k for k, _ in suggested]), ORANGE))
+                if missing:
+                    segs.append(((' ' if (cite or suggested) else '') + _fmt_marker(style, [k for k, _ in missing]), RED))
+                actions.append((s, e, segs))
+            for s, e, segs in reversed(actions):
+                _splice_marker(para, s, e, segs)
 
     buf = io.BytesIO(); doc.save(buf)
     return _fix_zoom(buf.getvalue()), report
