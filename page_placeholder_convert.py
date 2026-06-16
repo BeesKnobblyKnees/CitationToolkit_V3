@@ -95,9 +95,11 @@ if do_green:
                    "converts one when a reference inside it resolves to your library - so plain "
                    "asides like \u201c(termed rebound deformity)\u201d are left untouched. Skim the "
                    "orange/red flags afterward to catch the occasional false positive or miss.")
-apply_near = st.checkbox(
-    "Also apply close matches where the year/journal differs (otherwise they are only suggested)",
-    value=False, key="pe_near")
+apply_near = True  # near/ambiguous matches are always applied now, then flagged to verify
+st.caption(
+    "Every citation with a library match is inserted as `{Author, Year #RecNum}` - including the "
+    "matcher's best guess for near and same-author/year cases. Those are listed in the match report "
+    "as **verify** so you can double-check the handful that need it, rather than hand-entering them.")
 
 go = st.button("Convert", type="primary", key="pe_go")
 
@@ -134,8 +136,8 @@ if res:
                    "these markers (or has no numbered entries). Check the source list.")
     m = st.columns(4)
     m[0].metric("Placeholders", sm["placeholders"])
-    m[1].metric("Applied refs", sm["resolved_refs"])
-    m[2].metric("Suggested", sm["suggested_refs"])
+    m[1].metric("Applied refs", sm["applied_refs"])
+    m[2].metric("To verify", sm["verify_refs"])
     m[3].metric("Unresolved", sm["unresolved_refs"])
 
     d1, d2 = st.columns(2)
@@ -148,16 +150,20 @@ if res:
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                            use_container_width=True, key="pe_dl2")
 
-    if sm["suggested_refs"] or sm["unresolved_refs"]:
-        st.info("Some references were only suggested or are missing from the library - "
-                "see the match report. Suggested = surname matched but year/journal differs.")
+    if sm["verify_refs"] or sm["unresolved_refs"]:
+        st.info("All matched references were applied. **%d** are best-guess matches flagged to "
+                "verify (the report marks same-author/year ones first); **%d** had no library match "
+                "and are left red - add them to the library." % (sm["verify_refs"], sm["unresolved_refs"]))
 
-    with st.expander("Match details", expanded=True):
-        rows = []
-        for r in report:
-            applied = "; ".join("%s #%d" % (rec['sur'], rec['id']) for _, rec in r['resolved'])
-            sugg = "; ".join("%s #%d?" % (rec['sur'], rec['id']) for _, rec in r['suggested'])
-            miss = "; ".join(str(k) for k, _ in r['missing'])
-            rows.append({"Placeholder": r['orig'][:50], "Applied": applied,
-                         "Suggested": sugg, "Unresolved": miss})
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+    rows = []
+    for r in report:
+        applied = "; ".join("%s #%d" % (rec['sur'], rec['id'])
+                            for _, rec in (r['resolved'] + r['suggested']))
+        amb = set(r.get('ambiguous', []))
+        verify = "; ".join(("%s #%d (same yr)" % (rec['sur'], rec['id'])) if key in amb
+                           else ("%s #%d" % (rec['sur'], rec['id']))
+                           for key, rec in r['suggested'])
+        miss = "; ".join(str(k) for k, _ in r['missing'])
+        rows.append({"Placeholder": r['orig'][:50], "Applied": applied,
+                     "Verify": verify, "Unresolved": miss})
+    st.dataframe(rows, use_container_width=True, hide_index=True)

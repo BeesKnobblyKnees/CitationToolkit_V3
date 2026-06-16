@@ -278,24 +278,27 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
     use_pat = do_green and typed_detect in ('pattern', 'both')
 
     def classify(key, surname, year, hint):
+        # Apply the best-guess record for exact, near AND ambiguous matches.
+        # near/ambiguous are still reported as 'suggested' so they show up in
+        # the verify list, but they DO get the {Author, Year #RecNum} applied.
         rec, score, kind = match_to_library(surname, year, hint, lib)
-        if rec and (kind == 'exact' or (kind == 'near' and apply_near)):
-            return 'resolved', (key, rec)
-        if rec and kind in ('near', 'ambiguous'):
-            return 'suggested', (key, rec)
-        return 'missing', (key, None)
+        if rec and kind in ('exact', 'near', 'ambiguous'):
+            return ('resolved' if kind == 'exact' else 'suggested'), (key, rec), kind
+        return 'missing', (key, None), 'none'
 
     def split_refs(text):
-        resolved, suggested, missing = [], [], []
+        resolved, suggested, missing, ambig = [], [], [], []
         bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
         for piece in text.split(';'):
             piece = piece.strip()
             if not piece or not re.search(r'\d', piece):
                 continue
             sur, year, hint = _parse_ref_text(piece)
-            state, item = classify(piece, sur, year, hint)
+            state, item, kind = classify(piece, sur, year, hint)
             bucket[state].append(item)
-        return resolved, suggested, missing
+            if kind == 'ambiguous':
+                ambig.append(item[0])
+        return resolved, suggested, missing, ambig
 
     # ---- pass 1: highlighted typed citations ----
     for para in doc.paragraphs:
@@ -318,9 +321,10 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 green_text = ''.join(runs[k].text for k in members)
                 lead = re.match(r'^([.\s]*)', green_text).group(1)
                 body = green_text[len(lead):].lstrip('(').rstrip().rstrip(')').rstrip()
-                resolved, suggested, missing = split_refs(body)
+                resolved, suggested, missing, ambig = split_refs(body)
                 report.append({'kind': 'green', 'orig': green_text.strip(),
-                               'resolved': resolved, 'suggested': suggested, 'missing': missing})
+                               'resolved': resolved, 'suggested': suggested,
+                               'missing': missing, 'ambiguous': ambig})
                 first, last = members[0], members[-1]
                 if first - 1 >= 0 and (runs[first - 1].text or '').rstrip().endswith('('):
                     pt = runs[first - 1].text
@@ -328,7 +332,8 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 if last + 1 < n and (runs[last + 1].text or '').lstrip().startswith(')'):
                     ft = runs[last + 1].text; pos = ft.find(')')
                     runs[last + 1].text = ft[:pos] + ft[pos + 1:]
-                cite = ('{' + '; '.join(_token(r) for _, r in resolved) + '}') if resolved else ''
+                applied = resolved + suggested
+                cite = ('{' + '; '.join(_token(r) for _, r in applied) + '}') if applied else ''
                 ref_run = runs[members[0]]
                 ref_run.text = lead + cite
                 ref_run.font.highlight_color = None
@@ -336,12 +341,9 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                     runs[k].text = ''
                     runs[k].font.highlight_color = None
                 anchor = ref_run._r
-                if suggested:
-                    anchor = _insert_like(para, anchor, ref_run,
-                        ((' ' if cite else '') + '(' + '; '.join(k for k, _ in suggested) + ')'), ORANGE)
                 if missing:
                     anchor = _insert_like(para, anchor, ref_run,
-                        ((' ' if (cite or suggested) else '') + '(' + '; '.join(k for k, _ in missing) + ')'), RED)
+                        ((' ' if cite else '') + '(' + '; '.join(k for k, _ in missing) + ')'), RED)
                 i = j
                 continue
 
@@ -359,19 +361,19 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                     continue
                 segs = []; pos = 0; touched = False
                 for mt in matches:
-                    resolved, suggested, missing = split_refs(mt.group(1))
+                    resolved, suggested, missing, ambig = split_refs(mt.group(1))
                     if not (resolved or suggested):
                         continue  # not a recognizable citation -> leave it in place
                     touched = True
                     report.append({'kind': 'pattern', 'orig': mt.group(0),
-                                   'resolved': resolved, 'suggested': suggested, 'missing': missing})
+                                   'resolved': resolved, 'suggested': suggested,
+                                   'missing': missing, 'ambiguous': ambig})
                     segs.append(('plain', t[pos:mt.start()]))
-                    if resolved:
-                        segs.append(('plain', '{' + '; '.join(_token(r) for _, r in resolved) + '}'))
-                    if suggested:
-                        segs.append((ORANGE, (' ' if resolved else '') + '(' + '; '.join(k for k, _ in suggested) + ')'))
+                    applied = resolved + suggested
+                    if applied:
+                        segs.append(('plain', '{' + '; '.join(_token(r) for _, r in applied) + '}'))
                     if missing:
-                        segs.append((RED, (' ' if (resolved or suggested) else '') + '(' + '; '.join(k for k, _ in missing) + ')'))
+                        segs.append((RED, (' ' if applied else '') + '(' + '; '.join(k for k, _ in missing) + ')'))
                     pos = mt.end()
                 if not touched:
                     continue
@@ -408,24 +410,26 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 in_bib = any(bib.get(num) is not None for num in nums)
                 if style != 'refmark' and not in_bib:
                     continue  # bracketed/parenthesised number that isn't a reference
-                resolved, suggested, missing = [], [], []
+                resolved, suggested, missing, ambig = [], [], [], []
                 bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
                 for num in nums:
                     sy = bib.get(num); hint = bibfull.get(num) or bibtext.get(num, '')
                     if not sy:
                         missing.append((num, None)); continue
-                    st, item = classify(num, sy[0], sy[1], hint)
+                    st, item, kind = classify(num, sy[0], sy[1], hint)
                     bucket[st].append(item)
+                    if kind == 'ambiguous':
+                        ambig.append(num)
                 report.append({'kind': style, 'orig': full[s:e],
-                               'resolved': resolved, 'suggested': suggested, 'missing': missing})
-                cite = ('{' + '; '.join(_token(r) for _, r in resolved) + '}') if resolved else ''
+                               'resolved': resolved, 'suggested': suggested,
+                               'missing': missing, 'ambiguous': ambig})
+                applied = resolved + suggested
+                cite = ('{' + '; '.join(_token(r) for _, r in applied) + '}') if applied else ''
                 segs = []
                 if cite:
                     segs.append((cite, None))
-                if suggested:
-                    segs.append(((' ' if cite else '') + _fmt_marker(style, [k for k, _ in suggested]), ORANGE))
                 if missing:
-                    segs.append(((' ' if (cite or suggested) else '') + _fmt_marker(style, [k for k, _ in missing]), RED))
+                    segs.append(((' ' if cite else '') + _fmt_marker(style, [k for k, _ in missing]), RED))
                 actions.append((s, e, segs))
             for s, e, segs in reversed(actions):
                 _splice_marker(para, s, e, segs)
@@ -447,12 +451,16 @@ def _fix_zoom(b):
 
 # ── summary + report doc ─────────────────────────────────────────────────── #
 def summarize(report):
+    applied = sum(len(r['resolved']) + len(r['suggested']) for r in report)
+    verify = sum(len(r['suggested']) for r in report)
     return {
         'placeholders': len(report),
-        'resolved_refs': sum(len(r['resolved']) for r in report),
-        'suggested_refs': sum(len(r['suggested']) for r in report),
+        'resolved_refs': applied,            # everything with a record is applied now
+        'applied_refs': applied,
+        'verify_refs': verify,               # applied but flagged to double-check
+        'suggested_refs': verify,
         'unresolved_refs': sum(len(r['missing']) for r in report),
-        'fully_done': sum(1 for r in report if r['resolved'] and not (r['suggested'] or r['missing'])),
+        'fully_done': sum(1 for r in report if (r['resolved'] or r['suggested']) and not r['missing']),
     }
 
 
@@ -479,12 +487,13 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
     r.bold = True; r.font.size = Pt(16); r.font.color.rgb = RGBColor.from_string(ACCENT)
     sm = summarize(report)
     sp = doc.add_paragraph(); sr = sp.add_run(
-        "%d placeholder(s):  %d reference(s) applied,  %d suggested (orange),  %d unresolved (red)."
-        % (sm['placeholders'], sm['resolved_refs'], sm['suggested_refs'], sm['unresolved_refs']))
+        "%d placeholder(s):  %d reference(s) applied  (%d of them flagged to verify),  %d unresolved (red)."
+        % (sm['placeholders'], sm['applied_refs'], sm['verify_refs'], sm['unresolved_refs']))
     sr.font.size = Pt(9); sr.bold = True
     note = doc.add_paragraph(); nr = note.add_run(
-        "Applied = inserted as {Author, Year #RecNum}. Suggested (orange in the document) = surname "
-        "matched but year/journal differs; verify, then accept or fix. Unresolved (red) = add to library.")
+        "Everything with a library match was applied as {Author, Year #RecNum}. VERIFY rows were "
+        "applied too but are the matcher's best guess - check the ones marked \u201csame author/year\u201d "
+        "first, those are the likeliest to need a swap. Unresolved (red) = not in the library, add it.")
     nr.font.size = Pt(8.5); nr.italic = True; nr.font.color.rgb = RGBColor.from_string("666666")
     doc.add_paragraph()
 
@@ -509,8 +518,11 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
                 _shade_run(rr, fill)
         for key, rec in row['resolved']:
             line("APPLIED   %s  \u2192  %s, %s #%d  (%s)" % (key, rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "1A6B2A")
+        amb = set(row.get('ambiguous', []))
         for key, rec in row['suggested']:
-            line("SUGGESTED %s  \u2192  %s, %s #%d  (%s)  \u2013 verify" % (key, rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "7A5A00", fill=ORANGE)
+            tag = "VERIFY (same author/year)" if key in amb else "VERIFY (near match)"
+            line("%s  %s  \u2192  %s, %s #%d  (%s)  \u2013 applied, double-check"
+                 % (tag, key, rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "7A5A00", fill=ORANGE)
         for key, rec in row['missing']:
             line("UNRESOLVED  %s  \u2013 add to library" % key, "8B1A1A", bold=True, fill=RED)
         if not (row['resolved'] or row['suggested'] or row['missing']):

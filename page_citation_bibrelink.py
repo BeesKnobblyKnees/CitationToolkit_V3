@@ -108,6 +108,14 @@ with t2:
                 f"**{r['orphan_bib_entries']}** are no longer cited (removed sections) "
                 f"and will drop out when EndNote rebuilds the bibliography."
             )
+            if r.get("verify_count"):
+                st.warning(
+                    f"**{r['verify_count']}** citation(s) were same-author-same-year cases the "
+                    "matcher couldn't separate by reference text. They were still inserted with the "
+                    "best-guess record — double-check these against the list below:"
+                )
+                for nz, tx in r.get("verify", []):
+                    st.caption("• " + ", ".join(str(n) for n in nz) + "  —  " + tx[:90])
             if r.get("footnote_locations"):
                 st.caption(
                     f"Includes **{r['footnote_locations']}** citation group(s) in "

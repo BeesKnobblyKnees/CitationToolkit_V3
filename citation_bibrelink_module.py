@@ -136,7 +136,8 @@ def _resolve_cite(key, hint, cites_by_id):
         return top[2], 'exact'
     if top[0] >= 1.0 and top[0] > second[0]:
         return top[2], 'near'
-    return None, 'ambiguous'
+    # indistinguishable -> still apply the best guess, but mark it for review
+    return top[2], 'ambiguous'
 
 
 def index_old_fieldcodes(old_bytes):
@@ -190,14 +191,16 @@ def _strip_disp(c):
 
 
 def _build_fieldcode(nums, bib, cites_by_id, bibfull, rstyle="citsup", superscript=True):
-    chosen = []
+    chosen = []; ambiguous = []
     for n in nums:
         key = bib.get(n)
         if key is None:
-            return None
+            return None, []
         cd, kind = _resolve_cite(key, bibfull.get(n, ''), cites_by_id)
-        if cd is None:          # missing or genuinely ambiguous -> placeholder
-            return None
+        if cd is None:          # truly missing -> placeholder
+            return None, []
+        if kind == 'ambiguous':
+            ambiguous.append(n)
         chosen.append(cd)
     rpr = '<w:rPr><w:rStyle w:val="%s"/></w:rPr>' % rstyle
     face = "superscript" if superscript else "normal"
@@ -214,7 +217,7 @@ def _build_fieldcode(nums, bib, cites_by_id, bibfull, rstyle="citsup", superscri
     en = "<EndNote>" + "".join(cites) + "</EndNote>"
     b64 = base64.b64encode(en.encode("utf-8")).decode("ascii")
     show = ", ".join(str(n) for n in nums)
-    return (f'<w:r>{rpr}<w:fldChar w:fldCharType="begin"><w:fldData xml:space="preserve">{b64}</w:fldData></w:fldChar></w:r>'
+    return ((f'<w:r>{rpr}<w:fldChar w:fldCharType="begin"><w:fldData xml:space="preserve">{b64}</w:fldData></w:fldChar></w:r>'
             f'<w:r>{rpr}<w:instrText xml:space="preserve"> ADDIN EN.CITE </w:instrText></w:r>'
             f'<w:r>{rpr}<w:fldChar w:fldCharType="begin"><w:fldData xml:space="preserve">{b64}</w:fldData></w:fldChar></w:r>'
             f'<w:r>{rpr}<w:instrText xml:space="preserve"> ADDIN EN.CITE.DATA </w:instrText></w:r>'
@@ -222,7 +225,7 @@ def _build_fieldcode(nums, bib, cites_by_id, bibfull, rstyle="citsup", superscri
             f'<w:r>{rpr}<w:fldChar w:fldCharType="end"/></w:r>'
             f'<w:r>{rpr}<w:fldChar w:fldCharType="separate"/></w:r>'
             f'<w:r>{rpr}<w:t xml:space="preserve">{show}</w:t></w:r>'
-            f'<w:r>{rpr}<w:fldChar w:fldCharType="end"/></w:r>')
+            f'<w:r>{rpr}<w:fldChar w:fldCharType="end"/></w:r>'), ambiguous)
 
 
 def _placeholder(nums, rstyle="citsup"):
@@ -239,7 +242,7 @@ def _scan_replace(xml, bib, bibtext, fieldxml_by_set, cites_by_id, construct,
     bibfull = bibfull or {}
     ambig = {k for k, v in cites_by_id.items() if len(v) > 1}
     runs = re.findall(r"<w:r\b(?:(?!</w:r>).)*?</w:r>", xml, re.DOTALL)
-    reps, placeholders, all_nums = [], [], []
+    reps, placeholders, all_nums, verify = [], [], [], []
     cur, cur_runs, last_num = [], [], -1
 
     def flush():
@@ -252,9 +255,11 @@ def _scan_replace(xml, bib, bibtext, fieldxml_by_set, cites_by_id, construct,
             if all(idents) and fs in fieldxml_by_set and not (fs & ambig):
                 reps.append((span, fieldxml_by_set[fs], "exact"))
             elif construct and all(idents) and all(i in cites_by_id for i in idents):
-                fc = _build_fieldcode(cur, bib, cites_by_id, bibfull, build_rstyle, build_superscript)
+                fc, amb_nums = _build_fieldcode(cur, bib, cites_by_id, bibfull, build_rstyle, build_superscript)
                 if fc:
                     reps.append((span, fc, "constructed"))
+                    if amb_nums:
+                        verify.append((amb_nums[:], " | ".join(bibtext.get(n, "?") for n in amb_nums)))
                 else:
                     reps.append((span, _placeholder(cur, build_rstyle), "placeholder"))
                     placeholders.append((cur[:], " | ".join(bibtext.get(n, "?") for n in cur)))
@@ -279,28 +284,29 @@ def _scan_replace(xml, bib, bibtext, fieldxml_by_set, cites_by_id, construct,
     out = xml
     for span, repl, _ in reps:
         out = out.replace(span, repl, 1)
-    return out, Counter(k for _, _, k in reps), placeholders, all_nums
+    return out, Counter(k for _, _, k in reps), placeholders, all_nums, verify
 
 
 def _relink_reference_footnotes(foot_xml, bib, bibtext, fieldxml_by_set, cites_by_id, construct, bibfull=None):
     """Relink only footnotes whose text mentions 'Reference', leaving all other
     footnotes (figure/table cross-refs, editorial notes) untouched."""
     out = foot_xml
-    kinds, phs, nums = Counter(), [], []
+    kinds, phs, nums, verify = Counter(), [], [], []
     for m in re.finditer(r"<w:footnote\b[^>]*>.*?</w:footnote>", foot_xml, re.DOTALL):
         block = m.group(0)
         vis = "".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", block))
         if "Reference" not in vis:
             continue
-        nb, k, p, n = _scan_replace(block, bib, bibtext, fieldxml_by_set, cites_by_id,
-                                    construct, cite_style="crossref", sep_require_style=False,
-                                    build_rstyle="crossref", build_superscript=False, bibfull=bibfull)
+        nb, k, p, n, v = _scan_replace(block, bib, bibtext, fieldxml_by_set, cites_by_id,
+                                       construct, cite_style="crossref", sep_require_style=False,
+                                       build_rstyle="crossref", build_superscript=False, bibfull=bibfull)
         if nb != block:
             out = out.replace(block, nb, 1)
             kinds += k
             phs += [(ns, "(footnote) " + tx) for ns, tx in p]
             nums += n
-    return out, kinds, phs, nums
+            verify += [(ns, "(footnote) " + tx) for ns, tx in v]
+    return out, kinds, phs, nums, verify
 
 
 def relink(draft_bytes, old_bytes, construct=True, bib_source_bytes=None):
@@ -317,15 +323,15 @@ def relink(draft_bytes, old_bytes, construct=True, bib_source_bytes=None):
     names = set(src.namelist())
 
     body_xml = src.read("word/document.xml").decode("utf-8")
-    body_out, body_kinds, body_ph, body_nums = _scan_replace(
+    body_out, body_kinds, body_ph, body_nums, body_verify = _scan_replace(
         body_xml, bib, bibtext, fieldxml_by_set, cites_by_id, construct,
         cite_style="citsup", sep_require_style=True,
         build_rstyle="citsup", build_superscript=True, bibfull=bibfull)
 
-    foot_out, foot_kinds, foot_ph, foot_nums = None, Counter(), [], []
+    foot_out, foot_kinds, foot_ph, foot_nums, foot_verify = None, Counter(), [], [], []
     if "word/footnotes.xml" in names:
         foot_xml = src.read("word/footnotes.xml").decode("utf-8")
-        foot_out, foot_kinds, foot_ph, foot_nums = _relink_reference_footnotes(
+        foot_out, foot_kinds, foot_ph, foot_nums, foot_verify = _relink_reference_footnotes(
             foot_xml, bib, bibtext, fieldxml_by_set, cites_by_id, construct, bibfull=bibfull)
         if foot_out == foot_xml:
             foot_out = None  # nothing changed; keep original part verbatim
@@ -341,11 +347,14 @@ def relink(draft_bytes, old_bytes, construct=True, bib_source_bytes=None):
                 z.writestr(item, src.read(item.filename))
 
     cited = set(body_nums) | set(foot_nums)
+    verify = body_verify + foot_verify
     report = {
         "locations": sum(body_kinds.values()) + sum(foot_kinds.values()),
         "exact": body_kinds.get("exact", 0) + foot_kinds.get("exact", 0),
         "constructed": body_kinds.get("constructed", 0) + foot_kinds.get("constructed", 0),
         "placeholders": body_kinds.get("placeholder", 0) + foot_kinds.get("placeholder", 0),
+        "verify": verify,                       # constructed best-guess (same author/year) to double-check
+        "verify_count": sum(len(nz) for nz, _ in verify),
         "unique_refs_cited": len(cited),
         "bibliography_entries": len(bibtext),
         "orphan_bib_entries": len(set(bibtext) - cited),
