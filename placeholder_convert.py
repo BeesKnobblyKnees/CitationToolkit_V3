@@ -202,6 +202,55 @@ def _insert_like(paragraph, after_r, ref_run, text, fill=None):
     return nr._r
 
 
+_SUP_STYLES = ('citsup', 'sup', 'Superscript', 'FootnoteReference', 'EndNoteBibliography')
+
+
+def _is_sup_cite(run):
+    """A run that is superscript-formatted and whose text is citation numbers."""
+    rpr = run._r.find(qn('w:rPr'))
+    if rpr is None:
+        return False
+    va = rpr.find(qn('w:vertAlign'))
+    is_sup = va is not None and va.get(qn('w:val')) == 'superscript'
+    if not is_sup:
+        rs = rpr.find(qn('w:rStyle'))
+        is_sup = rs is not None and rs.get(qn('w:val')) in _SUP_STYLES
+    if not is_sup:
+        return False
+    t = run.text or ''
+    return bool(re.search(r'\d', t)) and bool(re.fullmatch(r'[\d,;\s\u2013\u2012-]+', t))
+
+
+def _unsuperscript(run):
+    """Drop superscript so an inserted {Author, Year #Rec} reads as normal text
+    (EndNote re-applies the superscript style on Update Citations)."""
+    rpr = run._r.find(qn('w:rPr'))
+    if rpr is None:
+        return
+    for va in rpr.findall(qn('w:vertAlign')):
+        rpr.remove(va)
+    for rs in rpr.findall(qn('w:rStyle')):
+        if rs.get(qn('w:val')) in _SUP_STYLES:
+            rpr.remove(rs)
+
+
+_SUP_UNITS = {'cm', 'mm', 'm', 'km', 'nm', 'um', 'dm', 'kg', 'g', 'mg', 'ug', 'ng',
+              'ml', 'l', 'dl', 'mol', 'mmol', 'kpa', 'mmhg', 'hz', 'db'}
+_SUP_VARS = set('xyztnprkmij')
+
+
+def _looks_like_exponent(prev_text):
+    """True if a superscript number is really an exponent/unit power (cm^2, x^2,
+    m^3) rather than a citation. Citations follow a word, a year or punctuation."""
+    if not prev_text or prev_text[-1].isspace():
+        return False                       # space before it -> citation
+    tail = re.search(r'([A-Za-z\u00b5]+)$', prev_text)
+    if not tail:
+        return False                       # preceded by a digit/punctuation -> citation
+    tok = tail.group(1).lower()
+    return tok in _SUP_UNITS or (len(tok) == 1 and tok in _SUP_VARS)
+
+
 # ── numbered citation markers: [[REF n]] / [n] / (n) ──────────────────────── #
 _NUM_PAT = {
     'refmark': re.compile(r'\[\[REF\s*([\d,\s\u2013-]+)\]\]'),
@@ -433,6 +482,58 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 actions.append((s, e, segs))
             for s, e, segs in reversed(actions):
                 _splice_marker(para, s, e, segs)
+
+    # ---- pass 4: superscript numbered citations  (Vancouver / JAMA ^1,2) ----
+    if do_refmarkers and 'superscript' in (ref_styles or ()):
+        for para in doc.paragraphs:
+            runs = para.runs
+            n = len(runs)
+            i = 0
+            while i < n:
+                if not _is_sup_cite(runs[i]):
+                    i += 1
+                    continue
+                members = [i]; j = i + 1
+                while j < n:
+                    if _is_sup_cite(runs[j]):
+                        members.append(j); j += 1
+                    elif re.fullmatch(r'[\s,;\u2013\u2012-]+', runs[j].text or '') and j + 1 < n and _is_sup_cite(runs[j + 1]):
+                        members.append(j); j += 1
+                    else:
+                        break
+                group_text = ''.join(runs[k].text or '' for k in members)
+                nums = _expand_nums(group_text.replace(';', ','))
+                prev_text = runs[members[0] - 1].text if members[0] > 0 else ''
+                if (not nums or _looks_like_exponent(prev_text)
+                        or not any(bib.get(x) is not None for x in nums)):
+                    i = j; continue
+                resolved, suggested, missing, ambig = [], [], [], []
+                bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
+                for num in nums:
+                    sy = bib.get(num); hint = bibfull.get(num) or bibtext.get(num, '')
+                    if not sy:
+                        missing.append((num, None)); continue
+                    st, item, kind = classify(num, sy[0], sy[1], hint)
+                    bucket[st].append(item)
+                    if kind == 'ambiguous':
+                        ambig.append(num)
+                report.append({'kind': 'superscript', 'orig': group_text.strip(),
+                               'resolved': resolved, 'suggested': suggested,
+                               'missing': missing, 'ambiguous': ambig})
+                applied = resolved + suggested
+                cite = ('{' + '; '.join(_token(r) for _, r in applied) + '}') if applied else ''
+                ref_run = runs[members[0]]
+                # insert any unresolved numbers first, still superscript + red
+                if missing:
+                    _insert_like(para, ref_run._r, ref_run,
+                                 (' ' if cite else '') + ', '.join(str(k) for k, _ in missing), RED)
+                # the resolved citation becomes normal-baseline {Author, Year #Rec}
+                ref_run.text = cite
+                _unsuperscript(ref_run)
+                ref_run.font.highlight_color = None
+                for k in members[1:]:
+                    runs[k].text = ''
+                i = j
 
     buf = io.BytesIO(); doc.save(buf)
     return _fix_zoom(buf.getvalue()), report

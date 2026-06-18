@@ -28,7 +28,7 @@ M_BOTH = "Both"
 
 HL = {"Green": "GREEN", "Bright green": "BRIGHT_GREEN", "Yellow": "YELLOW",
       "Turquoise": "TURQUOISE", "Pink": "PINK"}
-STYLE = {"[[REF #]]": "refmark", "[#]": "bracket", "(#)": "paren"}
+STYLE = {"[[REF #]]": "refmark", "[#]": "bracket", "(#)": "paren", "Superscript \u00b9\u00b2": "superscript"}
 
 st.markdown("## Placeholder \u2192 EndNote")
 st.markdown(
@@ -62,6 +62,11 @@ if do_ref:
         st.caption("`[#]` and `(#)` are only converted when the number is actually in the "
                    "reference list, so stray items like `(99)` or an enumeration are left alone. "
                    "`(#)` is the riskier one - enable it only if your citations really use parentheses.")
+    if "Superscript \u00b9\u00b2" in picks:
+        st.caption("Superscript detects Vancouver/JAMA-style superscript numbers (\u00b9 \u00b2) and "
+                   "resolves them by reference number. Unit and variable powers like cm\u00b2 or x\u00b2 "
+                   "are skipped automatically; the inserted citation is placed on the normal baseline "
+                   "so EndNote re-applies your superscript style on Update.")
     st.markdown("**Where do the citation numbers come from?**")
     src = st.radio(
         "Reference-list source",
