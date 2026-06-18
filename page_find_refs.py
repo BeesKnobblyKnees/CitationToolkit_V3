@@ -63,6 +63,13 @@ use_pubmed = st.checkbox(
     "Fall back to PubMed when CrossRef finds nothing", value=True,
     help="Good for medical references CrossRef misses. Uses NCBI E-utilities (free).")
 
+insecure = st.checkbox(
+    "Skip TLS certificate verification", value=False,
+    help="The app already retries without verification when the network blocks TLS "
+         "(common on hospital / SSL-inspection Wi-Fi). Tick this only to skip the "
+         "verified attempt from the start - it just makes lookups a touch faster on "
+         "those networks. Lookups are public CrossRef/PubMed metadata.")
+
 go = st.button("Search", type="primary")
 
 if go:
@@ -75,7 +82,7 @@ if go:
             try:
                 st.session_state["rf_results"] = rf.find_references(
                     queries, rows=int(rows), mailto=(mailto.strip() or None),
-                    use_pubmed=use_pubmed)
+                    use_pubmed=use_pubmed, insecure=insecure)
             except Exception as e:
                 st.session_state["rf_results"] = None
                 st.error("Search failed: %s" % e)
@@ -97,7 +104,11 @@ if results:
         st.markdown("**%d.** %s" % (i + 1, (r["query"][:160] + ("..." if len(r["query"]) > 160 else ""))))
         if r["status"] == "error":
             n_err += 1
-            st.error("Lookup error: %s" % (r.get("error") or "unknown"))
+            err = r.get("error") or "unknown"
+            st.error("Lookup error: %s" % err)
+            if "CERTIFICATE" in err.upper() or "SSL" in err.upper():
+                st.caption("That's a TLS error from your network's SSL inspection - tick "
+                           "**Skip TLS certificate verification** above and search again.")
             report_rows.append({"Input": r["query"], "Status": "error",
                                 "Source": r.get("source", ""), "Included": "no"})
             continue

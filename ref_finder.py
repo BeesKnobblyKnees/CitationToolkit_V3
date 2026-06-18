@@ -15,11 +15,61 @@ faster "polite pool" and be a good citizen.
 """
 import json
 import time
+import ssl
 import urllib.parse
 import urllib.request
+import urllib.error
+
+try:
+    import certifi
+    _CA_FILE = certifi.where()
+except Exception:               # certifi not installed -> fall back to system store
+    _CA_FILE = None
 
 CROSSREF_URL = "https://api.crossref.org/works"
 DEFAULT_TIMEOUT = 20
+
+
+# ── TLS-tolerant HTTPS GET ───────────────────────────────────────────────────
+# Hospital / corporate networks often do SSL inspection (a middlebox presents its
+# own root cert) or ship a Python without a CA bundle, which makes verification
+# fail with "unable to get local issuer certificate" or "self-signed certificate
+# in certificate chain". CrossRef and PubMed only return public bibliographic
+# metadata, so when verification fails we retry without it rather than dead-end.
+
+def _ssl_context(verify):
+    if not verify:
+        return ssl._create_unverified_context()
+    if _CA_FILE:
+        return ssl.create_default_context(cafile=_CA_FILE)
+    return ssl.create_default_context()
+
+
+def _is_tls_trust_error(exc):
+    reason = getattr(exc, "reason", exc)
+    return isinstance(reason, ssl.SSLError) or "CERTIFICATE" in str(reason).upper()
+
+
+def _http_get(url, headers=None, timeout=DEFAULT_TIMEOUT, insecure=False):
+    """GET bytes from url. Unless insecure=True, tries a properly verified
+    request (certifi CA bundle) first and only retries unverified when TLS trust
+    itself fails - so a clean network still gets full verification."""
+    req = urllib.request.Request(url, headers=headers or {})
+
+    def _open(verify):
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=_ssl_context(verify)))
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.read()
+
+    if insecure:
+        return _open(False)
+    try:
+        return _open(True)
+    except urllib.error.URLError as e:
+        if _is_tls_trust_error(e):
+            return _open(False)
+        raise
 
 # CrossRef "type" -> (EndNote %0 reference type, RIS TY type)
 _TYPE_MAP = {
@@ -45,7 +95,7 @@ def _user_agent(mailto=None):
     return ua
 
 
-def search_crossref(query, rows=3, mailto=None, timeout=DEFAULT_TIMEOUT):
+def search_crossref(query, rows=3, mailto=None, timeout=DEFAULT_TIMEOUT, insecure=False):
     """Query CrossRef bibliographic search. Returns a list of raw CrossRef items
     (possibly empty). Network errors propagate to the caller."""
     query = (query or "").strip()
@@ -61,9 +111,9 @@ def search_crossref(query, rows=3, mailto=None, timeout=DEFAULT_TIMEOUT):
     if mailto:
         params["mailto"] = mailto
     url = CROSSREF_URL + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": _user_agent(mailto)})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8", "replace"))
+    raw = _http_get(url, headers={"User-Agent": _user_agent(mailto)},
+                    timeout=timeout, insecure=insecure)
+    data = json.loads(raw.decode("utf-8", "replace"))
     return data.get("message", {}).get("items", []) or []
 
 
@@ -191,7 +241,7 @@ def _eutils_params(extra, api_key, email):
     return p
 
 
-def esearch_pubmed(query, retmax=3, api_key=None, email=None, timeout=DEFAULT_TIMEOUT):
+def esearch_pubmed(query, retmax=3, api_key=None, email=None, timeout=DEFAULT_TIMEOUT, insecure=False):
     """Return a list of PMIDs for a free-text query."""
     query = (query or "").strip()
     if not query:
@@ -200,13 +250,13 @@ def esearch_pubmed(query, retmax=3, api_key=None, email=None, timeout=DEFAULT_TI
         {"db": "pubmed", "term": query, "retmode": "json",
          "retmax": str(max(1, min(int(retmax), 10)))}, api_key, email)
     url = EUTILS + "/esearch.fcgi?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": _user_agent(email)})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8", "replace"))
+    raw = _http_get(url, headers={"User-Agent": _user_agent(email)},
+                    timeout=timeout, insecure=insecure)
+    data = json.loads(raw.decode("utf-8", "replace"))
     return data.get("esearchresult", {}).get("idlist", []) or []
 
 
-def esummary_pubmed(pmids, api_key=None, email=None, timeout=DEFAULT_TIMEOUT):
+def esummary_pubmed(pmids, api_key=None, email=None, timeout=DEFAULT_TIMEOUT, insecure=False):
     """Return raw esummary docsum dicts (in PMID order) for a list of PMIDs."""
     pmids = [str(p) for p in pmids if str(p).strip()]
     if not pmids:
@@ -214,9 +264,9 @@ def esummary_pubmed(pmids, api_key=None, email=None, timeout=DEFAULT_TIMEOUT):
     params = _eutils_params(
         {"db": "pubmed", "id": ",".join(pmids), "retmode": "json"}, api_key, email)
     url = EUTILS + "/esummary.fcgi?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": _user_agent(email)})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8", "replace"))
+    raw = _http_get(url, headers={"User-Agent": _user_agent(email)},
+                    timeout=timeout, insecure=insecure)
+    data = json.loads(raw.decode("utf-8", "replace"))
     result = data.get("result", {}) or {}
     return [result[u] for u in result.get("uids", []) if u in result]
 
@@ -273,22 +323,26 @@ def pubmed_to_fields(doc):
     }
 
 
-def search_pubmed(query, rows=3, api_key=None, email=None, timeout=DEFAULT_TIMEOUT):
+def search_pubmed(query, rows=3, api_key=None, email=None, timeout=DEFAULT_TIMEOUT, insecure=False):
     """One-call convenience: esearch -> esummary -> field dicts."""
-    pmids = esearch_pubmed(query, retmax=rows, api_key=api_key, email=email, timeout=timeout)
+    pmids = esearch_pubmed(query, retmax=rows, api_key=api_key, email=email,
+                           timeout=timeout, insecure=insecure)
     if not pmids:
         return []
-    docs = esummary_pubmed(pmids, api_key=api_key, email=email, timeout=timeout)
+    docs = esummary_pubmed(pmids, api_key=api_key, email=email,
+                           timeout=timeout, insecure=insecure)
     return [pubmed_to_fields(d) for d in docs]
 
 
 def find_references(ref_strings, rows=3, mailto=None, use_pubmed=True,
-                    pubmed_api_key=None, pause=0.2, timeout=DEFAULT_TIMEOUT):
+                    pubmed_api_key=None, pause=0.2, timeout=DEFAULT_TIMEOUT,
+                    insecure=False):
     """For each reference string, query CrossRef; if CrossRef returns nothing,
     fall back to PubMed (when use_pubmed). Returns a list of result dicts:
         {query, status, source, candidates:[fields,...], error}
     status is one of: 'found' (>=1 candidate), 'notfound', 'error'.
-    'source' notes where the candidates came from ('crossref' | 'pubmed' | '')."""
+    'source' notes where the candidates came from ('crossref' | 'pubmed' | '').
+    insecure=True skips TLS verification (for SSL-inspection networks)."""
     results = []
     for q in ref_strings:
         q = (q or "").strip()
@@ -299,7 +353,8 @@ def find_references(ref_strings, rows=3, mailto=None, use_pubmed=True,
         errs = []
         # 1) CrossRef
         try:
-            items = search_crossref(q, rows=rows, mailto=mailto, timeout=timeout)
+            items = search_crossref(q, rows=rows, mailto=mailto, timeout=timeout,
+                                    insecure=insecure)
             cands = [crossref_to_fields(it) for it in items]
             if cands:
                 rec["candidates"] = cands
@@ -313,7 +368,7 @@ def find_references(ref_strings, rows=3, mailto=None, use_pubmed=True,
                 time.sleep(pause)
             try:
                 cands = search_pubmed(q, rows=rows, api_key=pubmed_api_key,
-                                      email=mailto, timeout=timeout)
+                                      email=mailto, timeout=timeout, insecure=insecure)
                 if cands:
                     rec["candidates"] = cands
                     rec["status"] = "found"
