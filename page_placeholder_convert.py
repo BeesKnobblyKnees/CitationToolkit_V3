@@ -23,7 +23,7 @@ if "pe_out" not in st.session_state:
     st.session_state["pe_out"] = None
 
 M_TYPED = "Typed / green-highlighted citations"
-M_REF = "Numbered markers  [[REF #]] · [#] · (#)"
+M_REF = "Numbered markers  [[REF #]] · [#] · (#) · \u00b9\u00b2 superscript"
 M_BOTH = "Both"
 
 HL = {"Green": "GREEN", "Bright green": "BRIGHT_GREEN", "Yellow": "YELLOW",
