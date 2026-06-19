@@ -5,6 +5,99 @@ import streamlit as st, zipfile, re, base64, io, html
 from pathlib import Path
 from shared import *
 
+
+def _page_text_columns(pg):
+    """Read a PDF page in human reading order, column-aware.
+
+    pdfplumber's extract_text() walks a two-column page straight across both
+    columns, fusing the left-column line with the right-column line beside it
+    (so reference 1 gets glued to the tail of reference 25, etc.). This detects
+    a central gutter; if the page is two-column it reads the LEFT column fully
+    top-to-bottom, then the RIGHT column, rebuilding lines from word positions.
+    Full-width / single-column pages fall back to normal extraction."""
+    try:
+        words = pg.extract_words(use_text_flow=False)
+    except Exception:
+        words = None
+    if not words:
+        return pg.extract_text() or ""
+    W = float(pg.width); cx = W / 2.0; band = 0.05 * W
+    spanning = sum(1 for w in words if w['x0'] < cx - band and w['x1'] > cx + band)
+    if spanning > max(4, 0.04 * len(words)):
+        cols = [words]                                   # full-width text
+    else:
+        cols = [[w for w in words if (w['x0'] + w['x1']) / 2 < cx],
+                [w for w in words if (w['x0'] + w['x1']) / 2 >= cx]]
+    out = []
+    for col in cols:
+        col = sorted(col, key=lambda w: (w['top'], w['x0']))
+        line, cur = [], None
+        for w in col:
+            if cur is None or abs(w['top'] - cur) <= 3.0:
+                line.append(w['text']); cur = w['top'] if cur is None else cur
+            else:
+                out.append(' '.join(line)); line = [w['text']]; cur = w['top']
+        if line:
+            out.append(' '.join(line))
+    return '\n'.join(out)
+
+
+def _pdf_columnar_text(pdf, p1, p2):
+    """Column-aware text for an inclusive 1-based page range."""
+    parts = []
+    for pg in pdf.pages[p1 - 1:p2]:
+        parts.append(_page_text_columns(pg))
+    return '\n'.join(parts).replace('\x07', '').replace('\u00ad', '')
+
+
+def _parse_refs(text, hard_cap=4000):
+    """Parse a numbered reference list into [(section, local_num, text), ...].
+
+    Reference starts are detected as a number + optional '.'/')' at the start of
+    a line, followed by an author letter. The sequence is then validated: a marker
+    is accepted only if it is the next expected number, OR a '1' that restarts the
+    count (a new section). This (a) skips stray numbers / page fragments, (b) keeps
+    wrapped references whole, and (c) handles chapters that number each section
+    separately, starting at 1 for each."""
+    cands = [(int(m.group(1)), m.start(), m.end())
+             for m in re.finditer(
+                 r'(?m)^[ \t]*(\d{1,3})[a-z]?[.)]?\s+(?=[A-Za-z])', text)]
+    accepted = []                       # (section, num, marker_start, text_start)
+    sec, expected = 1, 1
+    GAP = 8                              # tolerate up to a few deleted refs in a row
+    for num, mstart, tend in cands:
+        if num == expected:
+            accepted.append((sec, num, mstart, tend)); expected = num + 1
+        elif num == 1 and expected > 1:          # count restarts -> new section
+            sec += 1
+            accepted.append((sec, 1, mstart, tend)); expected = 2
+        elif expected < num <= expected + GAP:   # small forward jump = deleted ref(s)
+            accepted.append((sec, num, mstart, tend)); expected = num + 1
+        # otherwise a stray / page-fragment / backward number -> skip
+        if expected > hard_cap:
+            break
+    out = []
+    for i, (s, num, mstart, tend) in enumerate(accepted):
+        end = accepted[i + 1][2] if i + 1 < len(accepted) else len(text)
+        body = re.sub(r'\s+', ' ', text[tend:end]).strip()
+        out.append((s, num, body))
+    return out
+
+
+def _ref_labels(entries):
+    """Turn [(section, num, text)] into {label: text}. Labels are plain numbers
+    for a single-section list (backward compatible) and 'section.number' when the
+    list restarts per section, so duplicate local numbers never collide."""
+    multi = len({s for s, _, _ in entries}) > 1
+    refs, local = {}, {}
+    for sec, num, text in entries:
+        if len(text) <= 15:
+            continue
+        label = ("%d.%d" % (sec, num)) if multi else str(num)
+        refs[label] = text
+        local[label] = str(num)
+    return refs, local, multi
+
 # Only initialize non-widget session state keys
 # (audit_doc and audit_pdf are widget keys — Streamlit manages them)
 if "audit_result" not in st.session_state:
@@ -66,30 +159,19 @@ if audit_doc and audit_pdf:
         with st.spinner("Extracting bibliography from PDF pages "
                         f"{bib_p1}–{bib_p2}..."):
             # ── Extract PDF bibliography (specified pages only) ──────────
-            pdf_bib_text = ""
             with _plumber.open(audit_pdf) as _pdf:
-                for pg in _pdf.pages[bib_p1-1:bib_p2]:
-                    t = pg.extract_text()
-                    if t: pdf_bib_text += t + "\n"
+                pdf_bib_text = _pdf_columnar_text(_pdf, bib_p1, bib_p2)
 
-            pdf_refs = {}
-            # Two-column layout: refs appear as "N.\t..." anywhere on line
-            for m in _re.finditer(
-                r'(?:^|\s{2,})(\d+[a-z]?)\.\s*\x07?([^\n]{10,})',
-                pdf_bib_text, _re.MULTILINE):
-                num  = m.group(1)
-                text = _re.sub(r'\s+', ' ', m.group(2)).strip()
-                if len(text) > 15 and num not in pdf_refs:
-                    pdf_refs[num] = text
+            # Numbered reference list, parsed by validating the 1,2,3... sequence
+            # and restarting per section (column-aware text + sequential split =
+            # no fused/half references, and section-restart numbering supported).
+            pdf_refs, pdf_local, pdf_multi = _ref_labels(_parse_refs(pdf_bib_text))
 
         with st.spinner("Extracting body text from PDF pages "
                         f"{body_p1}–{body_p2}..."):
             # ── Extract PDF body text (specified pages only) ─────────────
-            pdf_body_text = ""
             with _plumber.open(audit_pdf) as _pdf:
-                for pg in _pdf.pages[body_p1-1:body_p2]:
-                    t = pg.extract_text()
-                    if t: pdf_body_text += t + "\n"
+                pdf_body_text = _pdf_columnar_text(_pdf, body_p1, body_p2)
 
             # Find all citation numbers in PDF body text
             # Superscripts in published text appear as plain numbers after words
@@ -104,28 +186,43 @@ if audit_doc and audit_pdf:
         with st.spinner("Reading Word document..."):
             # ── Extract Word bibliography ────────────────────────────────
             wdoc = _Doc(audit_doc)
-            ref_pat = _re.compile(r'^\s*(\d+[a-z]?)[\.)\s]\s+(.+)')
-            word_bib = {}
-            for p in wdoc.paragraphs:
-                m2 = ref_pat.match(p.text.strip())
-                if m2: word_bib[m2.group(1)] = p.text.strip()
+            # Word reference lists use "N Author" or "N. Author"; parse with the
+            # same restart-aware logic so per-section numbering doesn't collide.
+            word_text = "\n".join(p.text for p in wdoc.paragraphs)
+            word_bib, word_local, word_multi = _ref_labels(_parse_refs(word_text))
 
             # ── Word body superscript citation numbers ───────────────────
             with zipfile.ZipFile(io.BytesIO(audit_doc.getvalue())) as _z:
                 doc_xml = _z.read('word/document.xml').decode('utf-8')
             W_ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
             root_elem = _et.fromstring(doc_xml.encode('utf-8'))
+            # Superscript citations can be marked either by a direct vertAlign or
+            # by a character style (citsup, sup, Superscript, FootnoteReference...).
+            # Detecting only vertAlign misses citsup-styled numbers and flags every
+            # reference as uncited. (root.iter is recursive, so runs inside tracked
+            # changes <w:ins>/<w:moveTo> are included.)
+            _sup_styles = {'citsup', 'sup', 'superscript', 'footnotereference',
+                           'endnotebibliography', 'endnotereference'}
             word_body_cited = set()
             for r in root_elem.iter(f'{{{W_ns}}}r'):
                 rpr = r.find(f'{{{W_ns}}}rPr')
-                if rpr is None: continue
+                if rpr is None:
+                    continue
                 va = rpr.find(f'{{{W_ns}}}vertAlign')
-                if va is None or va.get(f'{{{W_ns}}}val') != 'superscript': continue
+                rs = rpr.find(f'{{{W_ns}}}rStyle')
+                is_sup = (va is not None and va.get(f'{{{W_ns}}}val') == 'superscript') or \
+                         (rs is not None and (rs.get(f'{{{W_ns}}}val') or '').lower()
+                          in _sup_styles)
+                if not is_sup:
+                    continue
                 t_el = r.find(f'{{{W_ns}}}t')
                 txt  = (t_el.text or '') if t_el is not None else ''
-                for part in _re.split(r'[,;\s]+', txt):
+                if not _re.fullmatch(r'[\d,;\s\u2013\-]+', txt or ''):
+                    continue                       # digits + separators only
+                for part in _re.split(r'[,;\s\u2013\-]+', txt):
                     p2 = part.strip().rstrip('.')
-                    if p2.isdigit(): word_body_cited.add(p2)
+                    if p2.isdigit():
+                        word_body_cited.add(p2)
 
             cited_rns = set(_re.findall(r'&lt;RecNum&gt;(\d+)&lt;/RecNum&gt;', doc_xml))
             total_field_rns = len(cited_rns)
@@ -148,12 +245,28 @@ if audit_doc and audit_pdf:
                               if key not in pdf_keys]
 
         pdf_nums  = set(pdf_refs.keys())
-        not_in_pdf_body  = {n for n in pdf_nums if n not in pdf_body_cited}
-        not_in_word_body = {n for n in pdf_nums if n not in word_body_cited}
+        not_in_pdf_body  = {lab for lab in pdf_refs
+                            if pdf_local[lab] not in pdf_body_cited}
+        not_in_word_body = {lab for lab in pdf_refs
+                            if pdf_local[lab] not in word_body_cited}
+
+        def _lab_sort(lab):
+            try:
+                return tuple(int(p) for p in str(lab).split('.'))
+            except ValueError:
+                return (999,)
 
         # ── Results ──────────────────────────────────────────────────────
         st.divider()
         st.markdown("### Section 1 — Bibliography comparison")
+        if pdf_multi or word_multi:
+            _ns = len({lab.split('.')[0] for lab in pdf_refs}) if pdf_multi else \
+                  len({lab.split('.')[0] for lab in word_bib})
+            st.caption(f"↳ Section-restart numbering detected ({_ns} sections). "
+                       "Refs are labelled section.number (e.g. 2.5) so duplicate "
+                       "numbers across sections don't collide. Body-citation checks "
+                       "below match on the local number within a section, so a number "
+                       "reused across sections is treated as cited if it appears anywhere.")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Published PDF refs",     len(pdf_refs))
         c2.metric("Word doc refs",          len(word_bib))
@@ -165,7 +278,7 @@ if audit_doc and audit_pdf:
         if missing_from_word:
             st.error(f"⚠ **{len(missing_from_word)} ref(s) in the published PDF are missing from the Word document.**")
             with st.expander(f"Missing from Word ({len(missing_from_word)})", expanded=True):
-                for num, text in sorted(missing_from_word, key=lambda x: int(x[0]) if x[0].isdigit() else 999):
+                for num, text in sorted(missing_from_word, key=lambda x: _lab_sort(x[0])):
                     st.markdown(f'<div class="ref-item error">#{num} — {text[:100]}</div>',
                                 unsafe_allow_html=True)
             # Generate ENW
@@ -208,7 +321,7 @@ if audit_doc and audit_pdf:
             with st.expander(f"Not cited in published body ({len(not_in_pdf_body)})", expanded=True):
                 st.caption("These appear in the published bibliography but no citation number "
                            "was detected in the published body text pages specified.")
-                for n in sorted(not_in_pdf_body, key=lambda x: int(x) if x.isdigit() else 999):
+                for n in sorted(not_in_pdf_body, key=_lab_sort):
                     ref_text = pdf_refs.get(n, 'Unknown ref')
                     st.markdown(f'<div class="ref-item warning">#{n} — {ref_text[:100]}</div>',
                                 unsafe_allow_html=True)
@@ -229,7 +342,7 @@ if audit_doc and audit_pdf:
                 st.caption("These appear in the published bibliography but their reference "
                            "number was not found as an inline superscript in the Word document. "
                            "May indicate citations lost during merge, or renumbering issues.")
-                for n in sorted(not_in_word_body, key=lambda x: int(x) if x.isdigit() else 999):
+                for n in sorted(not_in_word_body, key=_lab_sort):
                     ref_text = pdf_refs.get(n, 'Unknown ref')
                     st.markdown(f'<div class="ref-item error">#{n} — {ref_text[:100]}</div>',
                                 unsafe_allow_html=True)
