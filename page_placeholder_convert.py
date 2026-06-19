@@ -139,11 +139,12 @@ if res:
     if was_ref and sm["placeholders"] and sm["resolved_refs"] == 0 and sm["unresolved_refs"]:
         st.warning("No numbered markers resolved - the chosen reference list may not match "
                    "these markers (or has no numbered entries). Check the source list.")
-    m = st.columns(4)
+    m = st.columns(5)
     m[0].metric("Placeholders", sm["placeholders"])
     m[1].metric("Applied refs", sm["applied_refs"])
     m[2].metric("To verify", sm["verify_refs"])
     m[3].metric("Unresolved", sm["unresolved_refs"])
+    m[4].metric("Dangling", sm.get("dangling_refs", 0))
 
     d1, d2 = st.columns(2)
     with d1:
@@ -155,10 +156,16 @@ if res:
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                            use_container_width=True, key="pe_dl2")
 
-    if sm["verify_refs"] or sm["unresolved_refs"]:
-        st.info("All matched references were applied. **%d** are best-guess matches flagged to "
-                "verify (the report marks same-author/year ones first); **%d** had no library match "
-                "and are left red - add them to the library." % (sm["verify_refs"], sm["unresolved_refs"]))
+    if sm["verify_refs"] or sm["unresolved_refs"] or sm.get("dangling_refs"):
+        msg = ("All matched references were applied. **%d** are best-guess matches flagged to "
+               "verify (the report marks same-author/year ones first); **%d** had no library match "
+               "and are left red - add them to the library."
+               % (sm["verify_refs"], sm["unresolved_refs"]))
+        if sm.get("dangling_refs"):
+            msg += (" **%d** dangling - the in-text number has no entry in the reference list at all "
+                    "(reference deleted or numbering off); fix the list or remove the citation."
+                    % sm["dangling_refs"])
+        st.info(msg)
 
     rows = []
     for r in report:
@@ -169,6 +176,7 @@ if res:
                            else ("%s #%d" % (rec['sur'], rec['id']))
                            for key, rec in r['suggested'])
         miss = "; ".join(str(k) for k, _ in r['missing'])
+        dang = "; ".join("no ref #%s" % n for n in r.get('dangling', []))
         rows.append({"Placeholder": r['orig'][:50], "Applied": applied,
-                     "Verify": verify, "Unresolved": miss})
+                     "Verify": verify, "Unresolved": miss, "Dangling": dang})
     st.dataframe(rows, use_container_width=True, hide_index=True)

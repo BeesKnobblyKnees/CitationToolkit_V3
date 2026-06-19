@@ -19,6 +19,7 @@ Output states (per reference):
 """
 import io, re, zipfile, sqlite3, difflib, html, copy
 from docx import Document
+from docx.text.run import Run
 from docx.shared import Pt, RGBColor, Inches
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -239,6 +240,34 @@ _SUP_UNITS = {'cm', 'mm', 'm', 'km', 'nm', 'um', 'dm', 'kg', 'g', 'mg', 'ug', 'n
 _SUP_VARS = set('xyztnprkmij')
 
 
+_W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+# Tracked-change wrappers whose runs DISAPPEAR when changes are accepted.
+_TC_DROP = (_W + 'del', _W + 'moveFrom')
+
+
+def _effective_runs(para):
+    """python-docx's paragraph.runs only returns runs that are DIRECT children of
+    <w:p>; runs nested inside tracked-change wrappers (<w:ins>, <w:moveTo>, and
+    also <w:del>/<w:moveFrom>) are invisible to it. A citation sitting inside an
+    inserted or moved span is therefore never seen by the converter.
+
+    This returns Run objects for every <w:r> in document order that will survive
+    an 'accept all changes' - i.e. direct runs plus those inside <w:ins>/<w:moveTo>
+    - while skipping runs inside <w:del>/<w:moveFrom> (which would be removed)."""
+    out = []
+    for r in para._p.iter(_W + 'r'):
+        anc = r.getparent()
+        drop = False
+        while anc is not None and anc is not para._p:
+            if anc.tag in _TC_DROP:
+                drop = True
+                break
+            anc = anc.getparent()
+        if not drop:
+            out.append(Run(r, para))
+    return out
+
+
 def _looks_like_exponent(prev_text):
     """True if a superscript number is really an exponent/unit power (cm^2, x^2,
     m^3) rather than a citation. Citations follow a word, a year or punctuation."""
@@ -278,7 +307,7 @@ def _fmt_marker(style, nums):
 def _splice_marker(para, s, e, segments):
     """Replace the [s,e) span of a paragraph's text (which may cross runs) with
     the given (text, fill) segments, preserving surrounding runs/formatting."""
-    runs = para.runs
+    runs = _effective_runs(para)
     texts = [r.text or '' for r in runs]
     pos, spans = 0, []
     for t in texts:
@@ -351,7 +380,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
 
     # ---- pass 1: highlighted typed citations ----
     for para in doc.paragraphs:
-        runs = para.runs
+        runs = _effective_runs(para)
         n = len(runs)
         i = 0
         while i < n:
@@ -401,7 +430,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
     # ---- pass 2: pattern-detected typed citations (no highlight) ----
     if use_pat:
         for para in doc.paragraphs:
-            for run in list(para.runs):
+            for run in list(_effective_runs(para)):
                 t = run.text or ''
                 if not t or '[[REF' in t or ('{' in t and '#' in t) or _has_shd(run):
                     continue
@@ -437,7 +466,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
     if do_refmarkers and ref_styles:
         pats = [(s, _NUM_PAT[s]) for s in ref_styles if s in _NUM_PAT]
         for para in doc.paragraphs:
-            full = ''.join(r.text or '' for r in para.runs)
+            full = ''.join(r.text or '' for r in _effective_runs(para))
             if not full:
                 continue
             found = []
@@ -486,7 +515,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
     # ---- pass 4: superscript numbered citations  (Vancouver / JAMA ^1,2) ----
     if do_refmarkers and 'superscript' in (ref_styles or ()):
         for para in doc.paragraphs:
-            runs = para.runs
+            runs = _effective_runs(para)
             n = len(runs)
             i = 0
             while i < n:
@@ -504,29 +533,42 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 group_text = ''.join(runs[k].text or '' for k in members)
                 nums = _expand_nums(group_text.replace(';', ','))
                 prev_text = runs[members[0] - 1].text if members[0] > 0 else ''
-                if (not nums or _looks_like_exponent(prev_text)
-                        or not any(bib.get(x) is not None for x in nums)):
+                if not nums or _looks_like_exponent(prev_text) or not bib:
                     i = j; continue
-                resolved, suggested, missing, ambig = [], [], [], []
+                maxnum = max(set(bib) | set(bibtext)) if (bib or bibtext) else 0
+                resolved, suggested, missing, ambig, dangling = [], [], [], [], []
                 bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
                 for num in nums:
-                    sy = bib.get(num); hint = bibfull.get(num) or bibtext.get(num, '')
+                    sy = bib.get(num)
                     if not sy:
-                        missing.append((num, None)); continue
+                        if num in bibtext:
+                            # the reference exists in the list but its surname/year
+                            # couldn't be parsed -> unresolved (can't match), NOT dangling.
+                            missing.append((num, None))
+                        elif num <= maxnum:
+                            # a real gap inside the numbered range = dangling citation
+                            # (reference deleted, or the in-text number is wrong).
+                            dangling.append(num)
+                        continue
+                    hint = bibfull.get(num) or bibtext.get(num, '')
                     st, item, kind = classify(num, sy[0], sy[1], hint)
                     bucket[st].append(item)
                     if kind == 'ambiguous':
                         ambig.append(num)
+                if not (resolved or suggested or missing or dangling):
+                    i = j; continue
                 report.append({'kind': 'superscript', 'orig': group_text.strip(),
                                'resolved': resolved, 'suggested': suggested,
-                               'missing': missing, 'ambiguous': ambig})
+                               'missing': missing, 'ambiguous': ambig,
+                               'dangling': dangling})
                 applied = resolved + suggested
                 cite = ('{' + '; '.join(_token(r) for _, r in applied) + '}') if applied else ''
                 ref_run = runs[members[0]]
-                # insert any unresolved numbers first, still superscript + red
-                if missing:
+                # insert any unresolved + dangling numbers first, still superscript + red
+                flagged = [k for k, _ in missing] + dangling
+                if flagged:
                     _insert_like(para, ref_run._r, ref_run,
-                                 (' ' if cite else '') + ', '.join(str(k) for k, _ in missing), RED)
+                                 (' ' if cite else '') + ', '.join(str(k) for k in sorted(set(flagged))), RED)
                 # the resolved citation becomes normal-baseline {Author, Year #Rec}
                 ref_run.text = cite
                 _unsuperscript(ref_run)
@@ -561,7 +603,8 @@ def summarize(report):
         'verify_refs': verify,               # applied but flagged to double-check
         'suggested_refs': verify,
         'unresolved_refs': sum(len(r['missing']) for r in report),
-        'fully_done': sum(1 for r in report if (r['resolved'] or r['suggested']) and not r['missing']),
+        'dangling_refs': sum(len(r.get('dangling', [])) for r in report),
+        'fully_done': sum(1 for r in report if (r['resolved'] or r['suggested']) and not r['missing'] and not r.get('dangling')),
     }
 
 
@@ -587,14 +630,20 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
     h = doc.add_paragraph(); r = h.add_run(title)
     r.bold = True; r.font.size = Pt(16); r.font.color.rgb = RGBColor.from_string(ACCENT)
     sm = summarize(report)
-    sp = doc.add_paragraph(); sr = sp.add_run(
-        "%d placeholder(s):  %d reference(s) applied  (%d of them flagged to verify),  %d unresolved (red)."
-        % (sm['placeholders'], sm['applied_refs'], sm['verify_refs'], sm['unresolved_refs']))
+    sp = doc.add_paragraph(); _danglingtot = sm.get('dangling_refs', 0)
+    _summ = ("%d placeholder(s):  %d reference(s) applied  (%d of them flagged to verify),  %d unresolved (red)."
+             % (sm['placeholders'], sm['applied_refs'], sm['verify_refs'], sm['unresolved_refs']))
+    if _danglingtot:
+        _summ += "  %d dangling citation(s) - cited number with no reference in the list." % _danglingtot
+    sr = sp.add_run(_summ)
     sr.font.size = Pt(9); sr.bold = True
     note = doc.add_paragraph(); nr = note.add_run(
         "Everything with a library match was applied as {Author, Year #RecNum}. VERIFY rows were "
         "applied too but are the matcher's best guess - check the ones marked \u201csame author/year\u201d "
-        "first, those are the likeliest to need a swap. Unresolved (red) = not in the library, add it.")
+        "first, those are the likeliest to need a swap. Unresolved (red) = in your list but not in the "
+        "library, add it. DANGLING (red) = the in-text number has no matching entry in the reference "
+        "list at all - the reference was likely deleted or the numbering is off; fix the list or remove "
+        "the citation.")
     nr.font.size = Pt(8.5); nr.italic = True; nr.font.color.rgb = RGBColor.from_string("666666")
     doc.add_paragraph()
 
@@ -626,7 +675,10 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
                  % (tag, key, rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "7A5A00", fill=ORANGE)
         for key, rec in row['missing']:
             line("UNRESOLVED  %s  \u2013 add to library" % key, "8B1A1A", bold=True, fill=RED)
-        if not (row['resolved'] or row['suggested'] or row['missing']):
+        for num in row.get('dangling', []):
+            line("DANGLING  %s  \u2013 no reference #%s in the bibliography (citation points to a missing entry)"
+                 % (num, num), "8B1A1A", bold=True, fill=RED)
+        if not (row['resolved'] or row['suggested'] or row['missing'] or row.get('dangling')):
             line("(no references parsed)", "666666")
 
     table.autofit = False; table.allow_autofit = False

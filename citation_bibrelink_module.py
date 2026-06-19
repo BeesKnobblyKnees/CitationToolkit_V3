@@ -77,7 +77,10 @@ def parse_bibliography(draft_bytes):
         if len(rest) < 15:
             continue
         yr = re.findall(r'\b(18|19|20)(\d{2})\b', rest)
-        am = re.match(r'^([A-Z][a-zA-Z\-]+)', rest)
+        am = re.match(
+            r'^((?:(?:van|von|der|den|de|del|della|da|di|du|dos|das|la|le|el|'
+            r'ten|ter|af|zu|zur|zum|of)\s+)*'
+            r'[A-Z\u00C0-\u017F][A-Za-z\u00C0-\u017F\'\-]*)', rest)
         bibtext[num] = _format_ref(rest)
         if yr and am:
             bib[num] = (am.group(1).lower(), yr[-1][0] + yr[-1][1])
