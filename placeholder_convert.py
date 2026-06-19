@@ -20,6 +20,9 @@ Output states (per reference):
 import io, re, zipfile, sqlite3, difflib, html, copy
 from docx import Document
 from docx.text.run import Run
+from docx.text.paragraph import Paragraph
+from docx.oxml import parse_xml
+from lxml import etree
 from docx.shared import Pt, RGBColor, Inches
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -268,6 +271,55 @@ def _effective_runs(para):
     return out
 
 
+_XREF_STYLES = {'crossref', 'crossrefs', 'xref', 'xrefs'}
+_CUE_RE = re.compile(r'(?:\bref(?:erence)?s?\b|\bsee\b)\s*:?\s*$', re.I)
+
+
+def _xref_styled(run):
+    """True if a run carries a cross-reference character style (the style Word
+    applies to manually-keyed reference numbers like 'References 7, 8, 13')."""
+    rpr = run._r.find(qn('w:rPr'))
+    if rpr is None:
+        return False
+    rs = rpr.find(qn('w:rStyle'))
+    return rs is not None and (rs.get(qn('w:val')) or '').lower() in _XREF_STYLES
+
+
+def _is_num_run(run):
+    t = run.text or ''
+    return bool(re.fullmatch(r'\s*\d{1,3}[a-z]?\s*', t))
+
+
+def _clear_rstyle(run):
+    rpr = run._r.find(qn('w:rPr'))
+    if rpr is not None:
+        for rs in rpr.findall(qn('w:rStyle')):
+            rpr.remove(rs)
+
+
+def _iter_body_and_table_paras(doc):
+    """All paragraphs python-docx's doc.paragraphs misses inside tables, plus the
+    body paragraphs, de-duplicated and in a stable order."""
+    seen, out = set(), []
+
+    def add(paras):
+        for p in paras:
+            key = id(p._p)
+            if key not in seen:
+                seen.add(key); out.append(p)
+
+    def walk_tables(tables):
+        for tbl in tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    add(cell.paragraphs)
+                    walk_tables(cell.tables)
+
+    add(doc.paragraphs)
+    walk_tables(doc.tables)
+    return out
+
+
 def _looks_like_exponent(prev_text):
     """True if a superscript number is really an exponent/unit power (cm^2, x^2,
     m^3) rather than a citation. Citations follow a word, a year or punctuation."""
@@ -351,6 +403,33 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
             bib, bibtext, bibfull = {}, {}, {}
 
     doc = Document(io.BytesIO(docx_bytes))
+    _target_paras = _iter_body_and_table_paras(doc)
+
+    # Footnotes and endnotes live in separate parts python-docx's doc.paragraphs
+    # never exposes. Parse those trees now and fold their paragraphs into the scan
+    # set so EVERY pass (green, [[REF]], [#], (#), superscript, number lists) runs
+    # over them too; the mutated trees are serialised back in after saving.
+    _note_trees = {}
+    for _kind, _fname in (('footnotes', 'word/footnotes.xml'),
+                          ('endnotes', 'word/endnotes.xml')):
+        _blob = None
+        for _rel in doc.part.rels.values():
+            if _kind in _rel.reltype:
+                try:
+                    _blob = _rel.target_part.blob
+                except Exception:
+                    _blob = None
+                break
+        if not _blob:
+            continue
+        try:
+            _tree = parse_xml(_blob)
+        except Exception:
+            continue
+        _note_trees[_fname] = _tree
+        _target_paras = _target_paras + [Paragraph(_p, doc)
+                                         for _p in _tree.iter(qn('w:p'))]
+
     report = []
     use_hl = do_green and typed_detect in ('highlight', 'both')
     use_pat = do_green and typed_detect in ('pattern', 'both')
@@ -379,7 +458,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
         return resolved, suggested, missing, ambig
 
     # ---- pass 1: highlighted typed citations ----
-    for para in doc.paragraphs:
+    for para in _target_paras:
         runs = _effective_runs(para)
         n = len(runs)
         i = 0
@@ -429,7 +508,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
 
     # ---- pass 2: pattern-detected typed citations (no highlight) ----
     if use_pat:
-        for para in doc.paragraphs:
+        for para in _target_paras:
             for run in list(_effective_runs(para)):
                 t = run.text or ''
                 if not t or '[[REF' in t or ('{' in t and '#' in t) or _has_shd(run):
@@ -465,7 +544,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
     # ---- pass 3: numbered markers  [[REF n]] / [n] / (n) ----
     if do_refmarkers and ref_styles:
         pats = [(s, _NUM_PAT[s]) for s in ref_styles if s in _NUM_PAT]
-        for para in doc.paragraphs:
+        for para in _target_paras:
             full = ''.join(r.text or '' for r in _effective_runs(para))
             if not full:
                 continue
@@ -514,7 +593,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
 
     # ---- pass 4: superscript numbered citations  (Vancouver / JAMA ^1,2) ----
     if do_refmarkers and 'superscript' in (ref_styles or ()):
-        for para in doc.paragraphs:
+        for para in _target_paras:
             runs = _effective_runs(para)
             n = len(runs)
             i = 0
@@ -577,17 +656,112 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                     runs[k].text = ''
                 i = j
 
+    # ---- pass 5: plain reference-number lists  ("References 7, 8, 13, 17-19") ----
+    # Numbers carry a cross-reference character style (or follow a "References"/
+    # "See" cue). These are how figure/table reference lists and footnotes cite
+    # the bibliography. Handles comma lists and en-dash ranges; resolves each
+    # number to the library and replaces the list with EndNote temp citations.
+    def _process_numlists(paragraphs):
+        if not (do_refmarkers and 'numlist' in (ref_styles or ()) and bib):
+            return
+        maxnum = max(set(bib) | set(bibtext)) if (bib or bibtext) else 0
+        for para in paragraphs:
+            runs = _effective_runs(para)
+            n = len(runs); i = 0
+            while i < n:
+                r = runs[i]
+                cue = _CUE_RE.search(''.join((runs[k].text or '')
+                                             for k in range(max(0, i - 2), i)))
+                if not (_is_num_run(r) and (_xref_styled(r) or cue)):
+                    i += 1; continue
+                seq, members, j = [], [], i
+                while j < n:
+                    rj = runs[j]; tj = rj.text or ''
+                    if _is_num_run(rj) and (_xref_styled(rj) or seq or cue):
+                        seq.append(('n', int(re.search(r'\d+', tj).group())))
+                        members.append(j); j += 1
+                    elif re.fullmatch(r'\s*[\u2013\u2012\u2010-]\s*', tj):
+                        seq.append(('dash', None)); members.append(j); j += 1
+                    elif re.fullmatch(r'\s*[,;]\s*', tj):
+                        seq.append(('sep', None)); members.append(j); j += 1
+                    else:
+                        break
+                while seq and seq[-1][0] != 'n':            # trim trailing separators
+                    seq.pop(); members.pop()
+                if sum(1 for k, _ in seq if k == 'n') == 0:
+                    i = j; continue
+                nums, x = [], 0                              # expand ranges
+                while x < len(seq):
+                    if seq[x][0] == 'n':
+                        a = seq[x][1]; nums.append(a)
+                        if x + 2 < len(seq) and seq[x + 1][0] == 'dash' and seq[x + 2][0] == 'n':
+                            b = seq[x + 2][1]
+                            if a < b < a + 50:
+                                nums.extend(range(a + 1, b + 1))
+                            x += 3; continue
+                        x += 1
+                    else:
+                        x += 1
+                resolved, suggested, missing, ambig, dangling = [], [], [], [], []
+                bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
+                for num in nums:
+                    sy = bib.get(num)
+                    if not sy:
+                        if num in bibtext:
+                            missing.append((num, None))
+                        elif num <= maxnum:
+                            dangling.append(num)
+                        continue
+                    hint = bibfull.get(num) or bibtext.get(num, '')
+                    st, item, kind = classify(num, sy[0], sy[1], hint)
+                    bucket[st].append(item)
+                    if kind == 'ambiguous':
+                        ambig.append(num)
+                if not (resolved or suggested or missing or dangling):
+                    i = j; continue
+                report.append({'kind': 'numlist',
+                               'orig': ''.join(runs[k].text or '' for k in members).strip(),
+                               'resolved': resolved, 'suggested': suggested,
+                               'missing': missing, 'ambiguous': ambig, 'dangling': dangling})
+                applied = resolved + suggested
+                cite = ('{' + '; '.join(_token(rc) for _, rc in applied) + '}') if applied else ''
+                ref_run = runs[members[0]]
+                flagged = [k for k, _ in missing] + dangling
+                if flagged:
+                    _insert_like(para, ref_run._r, ref_run,
+                                 (' ' if cite else '') + ', '.join(str(k) for k in sorted(set(flagged))), RED)
+                ref_run.text = cite
+                _clear_rstyle(ref_run)
+                ref_run.font.highlight_color = None
+                for k in members[1:]:
+                    runs[k].text = ''
+                i = j
+
+    _process_numlists(_target_paras)
+
+    # Serialise the footnote/endnote trees that the passes just mutated in place.
+    extra_parts = {}
+    for _fname, _tree in _note_trees.items():
+        _xml = etree.tostring(_tree, encoding='unicode')
+        extra_parts[_fname] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + _xml
+        ).encode('utf-8')
+
     buf = io.BytesIO(); doc.save(buf)
-    return _fix_zoom(buf.getvalue()), report
+    return _fix_zoom(buf.getvalue(), extra_parts), report
 
 
-def _fix_zoom(b):
+def _fix_zoom(b, extra_parts=None):
+    extra_parts = extra_parts or {}
     zin = zipfile.ZipFile(io.BytesIO(b)); out = io.BytesIO()
     with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zout:
         for it in zin.infolist():
-            d = zin.read(it.filename)
-            if it.filename == 'word/settings.xml':
-                d = re.sub(rb'<w:zoom[^>]*/>', b'<w:zoom w:percent="100"/>', d)
+            if it.filename in extra_parts:
+                d = extra_parts[it.filename]
+            else:
+                d = zin.read(it.filename)
+                if it.filename == 'word/settings.xml':
+                    d = re.sub(rb'<w:zoom[^>]*/>', b'<w:zoom w:percent="100"/>', d)
             zout.writestr(it, d)
     return out.getvalue()
 

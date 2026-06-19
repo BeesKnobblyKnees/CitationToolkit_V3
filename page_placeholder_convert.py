@@ -23,12 +23,12 @@ if "pe_out" not in st.session_state:
     st.session_state["pe_out"] = None
 
 M_TYPED = "Typed / green-highlighted citations"
-M_REF = "Numbered markers  [[REF #]] · [#] · (#) · \u00b9\u00b2 superscript"
+M_REF = "Numbered markers  [[REF #]] · [#] · (#) · \u00b9\u00b2 superscript · ref lists"
 M_BOTH = "Both"
 
 HL = {"Green": "GREEN", "Bright green": "BRIGHT_GREEN", "Yellow": "YELLOW",
       "Turquoise": "TURQUOISE", "Pink": "PINK"}
-STYLE = {"[[REF #]]": "refmark", "[#]": "bracket", "(#)": "paren", "Superscript \u00b9\u00b2": "superscript"}
+STYLE = {"[[REF #]]": "refmark", "[#]": "bracket", "(#)": "paren", "Superscript \u00b9\u00b2": "superscript", "Reference number lists": "numlist"}
 
 st.markdown("## Placeholder \u2192 EndNote")
 st.markdown(
@@ -67,6 +67,13 @@ if do_ref:
                    "resolves them by reference number. Unit and variable powers like cm\u00b2 or x\u00b2 "
                    "are skipped automatically; the inserted citation is placed on the normal baseline "
                    "so EndNote re-applies your superscript style on Update.")
+    if "Reference number lists" in picks:
+        st.caption("Reference number lists handles plain comma/range lists like "
+                   "\u201cReferences 7, 8, 13, 17\u201319, 33\u201d \u2014 the format used in figure/table "
+                   "footnotes. Ranges are expanded (17\u201319 \u2192 17, 18, 19) and the whole list "
+                   "becomes EndNote citations.")
+    st.caption("All of the above are now detected in **footnotes, endnotes and table cells**, "
+               "not just the document body.")
     st.markdown("**Where do the citation numbers come from?**")
     src = st.radio(
         "Reference-list source",
