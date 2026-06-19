@@ -229,12 +229,17 @@ if audit_doc and audit_pdf:
 
         # ── Compare bibliographies ───────────────────────────────────────
         def ref_key(text):
+            """(surname, year). The surname is the words before the first author's
+            initials block, normalised so 'DeLuca' == 'De Luca', particles are kept
+            ('van der Linden'), and a 'Jr'/'Sr' suffix is ignored. Far more reliable
+            than taking the last token of the first comma-segment, which on a
+            single-author entry grabs the year."""
             text = _re.sub(r'^\d+[a-z]?[\.)\s]\s*', '', text).strip()
-            parts = _re.split(r',|;', text)
-            auth  = parts[0].strip().split()[-1].lower() if parts[0].strip() else ''
-            yr_m  = _re.search(r'\b(19|20)\d{2}\b', text)
-            yr    = yr_m.group(0) if yr_m else ''
-            return f"{auth} {yr}"
+            m = _re.match(r'^(.*?)\s+(?:[A-Z]\.?){1,3}(?=[\s,.;]|$)', text)
+            sur = m.group(1) if m else (text.split()[0] if text.split() else '')
+            sur = _re.sub(r"[\s'\-.]", '', sur.lower())
+            yrs = _re.findall(r'\b(?:19|20)\d{2}\b', text)
+            return sur, (yrs[-1] if yrs else '')
 
         word_keys = {ref_key(v): k for k, v in word_bib.items()}
         pdf_keys  = {ref_key(v): k for k, v in pdf_refs.items()}
@@ -243,6 +248,31 @@ if audit_doc and audit_pdf:
                               if key not in word_keys]
         extra_in_word     = [(num, word_bib[num])  for key, num in word_keys.items()
                               if key not in pdf_keys]
+
+        # Reconcile: a reference that's "missing" on one side and "extra" on the
+        # other with the SAME surname + a shared significant title word is really
+        # the same paper with a metadata difference (usually the year). Pull those
+        # out of the missing/extra lists into a clearer "differs between sources".
+        def _title_words(text):
+            t = _re.sub(r'^\d+[a-z]?[\.)\s]\s*', '', text)
+            t = _re.sub(r'^.*?(?:[A-Z]\.?){1,3}[\s,.;]', '', t, count=1)   # drop authors
+            return {w for w in _re.findall(r'[a-z]{5,}', t.lower())}
+
+        differs_between = []
+        _still_missing, _still_extra = [], list(extra_in_word)
+        for pnum, ptext in missing_from_word:
+            psur, pyr = ref_key(ptext); ptw = _title_words(ptext)
+            hit = None
+            for i, (wnum, wtext) in enumerate(_still_extra):
+                wsur, wyr = ref_key(wtext)
+                if wsur == psur and ptw & _title_words(wtext):
+                    hit = i; break
+            if hit is not None:
+                wnum, wtext = _still_extra.pop(hit)
+                differs_between.append((pnum, ptext, wnum, wtext))
+            else:
+                _still_missing.append((pnum, ptext))
+        missing_from_word, extra_in_word = _still_missing, _still_extra
 
         pdf_nums  = set(pdf_refs.keys())
         not_in_pdf_body  = {lab for lab in pdf_refs
@@ -304,7 +334,14 @@ if audit_doc and audit_pdf:
             for num, text in extra_in_word[:15]:
                 st.markdown(f"  • #{num} — {text[:80]}")
 
-        if not missing_from_word and not extra_in_word:
+        if differs_between:
+            st.warning(f"⚠ {len(differs_between)} ref(s) present in BOTH but with a "
+                       f"metadata difference (same author + title, usually the year):")
+            for pnum, ptext, wnum, wtext in differs_between:
+                st.markdown(f'<div class="ref-item warning">PDF #{pnum} — {ptext[:90]}<br>'
+                            f'Word #{wnum} — {wtext[:90]}</div>', unsafe_allow_html=True)
+
+        if not missing_from_word and not extra_in_word and not differs_between:
             st.success("✓ Word doc and published PDF bibliographies match perfectly.")
 
         st.divider()
