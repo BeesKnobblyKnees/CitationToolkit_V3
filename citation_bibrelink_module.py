@@ -385,7 +385,22 @@ if __name__ == "__main__":
     print("foot begins/ends:", f.count('fldCharType="begin"'), f.count('fldCharType="end"'))
 
 
-def build_placeholders_docx(placeholders, title="Citation Placeholders to Insert"):
+def _parse_bib_full(b):
+    """num -> full untruncated reference text, for the bibliography snapshot
+    appended to the placeholder list."""
+    full = {}
+    try:
+        d = docx.Document(io.BytesIO(b))
+    except Exception:
+        return full
+    for p in d.paragraphs:
+        m = re.match(r'^(\d{1,3})\s+(.*)', (p.text or '').strip())
+        if m and len(m.group(2)) >= 15:
+            full[int(m.group(1))] = m.group(2)
+    return full
+
+
+def build_placeholders_docx(placeholders, title="Citation Placeholders to Insert", bib_snapshot=None):
     """Render the placeholder list as a readable Word table:
     one row per placeholder, the [[REF #]] bold, each reference on its own line.
     placeholders: list of (nums_list, joined_text) where joined_text is
@@ -463,6 +478,35 @@ def build_placeholders_docx(placeholders, title="Citation Placeholders to Insert
     for rw in table.rows:
         for i, w in enumerate(widths):
             rw.cells[i].width = w
+
+    # ── bibliography snapshot ─────────────────────────────────────────────── #
+    # The numbered reference list relinked against, kept in the same list so the
+    # [[REF #]] numbers stay interpretable if the bibliography is later renumbered.
+    if bib_snapshot:
+        doc.add_paragraph()
+        _hb = doc.add_paragraph().add_run("Bibliography used (snapshot)")
+        _hb.bold = True; _hb.font.size = Pt(13); _hb.font.color.rgb = RGBColor.from_string(ACCENT)
+        _nb = doc.add_paragraph().add_run(
+            "The numbered reference list these citations were relinked against, captured at "
+            "relink time. Keep it to re-check the [[REF #]] numbers above if the bibliography "
+            "is later renumbered.")
+        _nb.font.size = Pt(8.5); _nb.italic = True; _nb.font.color.rgb = RGBColor.from_string("666666")
+        bt = doc.add_table(rows=1, cols=2); grid(bt)
+        for i, t in enumerate(["#", "Reference"]):
+            c = bt.rows[0].cells[i]; rn = c.paragraphs[0].add_run(t)
+            rn.bold = True; rn.font.size = Pt(10)
+            rn.font.color.rgb = RGBColor.from_string("FFFFFF"); shade(c, ACCENT)
+        _bp = bt.rows[0]._tr.get_or_add_trPr(); _bh = OxmlElement('w:tblHeader')
+        _bh.set(qn('w:val'), 'true'); _bp.append(_bh)
+        for num in sorted(bib_snapshot):
+            r2 = bt.add_row()
+            c0 = r2.cells[0]; rr0 = c0.paragraphs[0].add_run(str(num))
+            rr0.bold = True; rr0.font.size = Pt(9.5)
+            rr0.font.color.rgb = RGBColor.from_string(ACCENT); shade(c0, FILL)
+            rr1 = r2.cells[1].paragraphs[0].add_run(str(bib_snapshot[num])); rr1.font.size = Pt(9)
+        bt.autofit = False; bt.allow_autofit = False
+        for rw in bt.rows:
+            rw.cells[0].width = Inches(0.5); rw.cells[1].width = Inches(6.5)
 
     buf = _io.BytesIO(); doc.save(buf)
     # fix python-docx zoom (schema-required percent)

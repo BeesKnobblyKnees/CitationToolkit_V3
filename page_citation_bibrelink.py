@@ -11,7 +11,7 @@ import streamlit as st
 import io
 from pathlib import Path
 
-from citation_bibrelink_module import relink, parse_bibliography, index_old_fieldcodes, build_placeholders_docx
+from citation_bibrelink_module import relink, parse_bibliography, index_old_fieldcodes, build_placeholders_docx, _parse_bib_full
 
 if "br" not in st.session_state:
     st.session_state.br = {"draft": None, "old": None, "fixed": None,
@@ -142,7 +142,8 @@ with t3:
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                            type="primary", key="br_dl")
         if br["phs"]:
-            ph_docx = build_placeholders_docx(br["phs"])
+            _bibsnap = _parse_bib_full(br["bib_src"] or br["draft"])
+            ph_docx = build_placeholders_docx(br["phs"], bib_snapshot=_bibsnap)
             st.download_button("Download placeholder list (.docx)",
                                data=ph_docx,
                                file_name=base + "_placeholders.docx",
@@ -151,6 +152,12 @@ with t3:
             lines = ["CITATION PLACEHOLDERS TO INSERT", "=" * 50, ""]
             for nums, text in br["phs"]:
                 lines.append(f"[[REF {','.join(str(n) for n in nums)}]]  ->  {text}")
+            if _bibsnap:
+                lines += ["", "BIBLIOGRAPHY USED (SNAPSHOT)", "=" * 50,
+                          "Reference list relinked against; keep to re-check the [[REF #]] "
+                          "numbers if the bibliography is later renumbered.", ""]
+                for num in sorted(_bibsnap):
+                    lines.append(f"{num}. {_bibsnap[num]}")
             st.download_button("Download placeholder list (.txt)",
                                data="\n".join(lines).encode("utf-8"),
                                file_name=base + "_placeholders.txt",

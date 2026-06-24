@@ -385,6 +385,12 @@ def _splice_marker(para, s, e, segments):
 
 
 # ── conversion ───────────────────────────────────────────────────────────── #
+class _Report(list):
+    """Placeholder rows, plus .bib_snapshot ({num -> reference text}) so the
+    report can print the bibliography it resolved against for later reference."""
+    bib_snapshot = None
+
+
 def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
             highlight='GREEN', apply_near=False, bib_source_bytes=None,
             typed_detect='highlight', ref_styles=('refmark',)):
@@ -430,7 +436,11 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
         _target_paras = _target_paras + [Paragraph(_p, doc)
                                          for _p in _tree.iter(qn('w:p'))]
 
-    report = []
+    report = _Report()
+    # snapshot of the numbered reference list these markers were resolved against,
+    # so the report stays interpretable if the bibliography is later renumbered
+    report.bib_snapshot = (dict(bibfull) or dict(bibtext)
+                           or {n: ("%s, %s" % v) for n, v in bib.items()})
     use_hl = do_green and typed_detect in ('highlight', 'both')
     use_pat = do_green and typed_detect in ('pattern', 'both')
 
@@ -782,7 +792,7 @@ def summarize(report):
     }
 
 
-def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Report"):
+def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Report", bib_snapshot=None):
     ACCENT, FILL = "8B1A1A", "F3ECEC"
     def shade(cell, fill):
         tcPr = cell._tc.get_or_add_tcPr(); sh = OxmlElement('w:shd')
@@ -858,5 +868,34 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
     table.autofit = False; table.allow_autofit = False
     for rw in table.rows:
         rw.cells[0].width = Inches(2.0); rw.cells[1].width = Inches(5.0)
+
+    # ── bibliography snapshot ─────────────────────────────────────────────── #
+    # The reference list resolved against, kept at the end so the resolved/verify/
+    # unresolved rows above stay interpretable if the bibliography is renumbered.
+    snap = bib_snapshot or getattr(report, 'bib_snapshot', None)
+    if snap:
+        doc.add_paragraph()
+        _hb = doc.add_paragraph().add_run("Bibliography used (snapshot)")
+        _hb.bold = True; _hb.font.size = Pt(13); _hb.font.color.rgb = RGBColor.from_string(ACCENT)
+        _nb = doc.add_paragraph().add_run(
+            "The reference list these citations were resolved against, captured at conversion "
+            "time. Keep it to re-check the numbers above if the bibliography is later renumbered.")
+        _nb.font.size = Pt(8.5); _nb.italic = True; _nb.font.color.rgb = RGBColor.from_string("666666")
+        bt = doc.add_table(rows=1, cols=2); grid(bt)
+        for i, t in enumerate(["#", "Reference"]):
+            c = bt.rows[0].cells[i]; rn = c.paragraphs[0].add_run(t)
+            rn.bold = True; rn.font.size = Pt(10); rn.font.color.rgb = RGBColor.from_string("FFFFFF"); shade(c, ACCENT)
+        _bp = bt.rows[0]._tr.get_or_add_trPr(); _bh = OxmlElement('w:tblHeader')
+        _bh.set(qn('w:val'), 'true'); _bp.append(_bh)
+        for num in sorted(snap):
+            r2 = bt.add_row()
+            c0 = r2.cells[0]; rr0 = c0.paragraphs[0].add_run(str(num))
+            rr0.bold = True; rr0.font.size = Pt(9.5)
+            rr0.font.color.rgb = RGBColor.from_string(ACCENT); shade(c0, FILL)
+            rr1 = r2.cells[1].paragraphs[0].add_run(str(snap[num])); rr1.font.size = Pt(9)
+        bt.autofit = False; bt.allow_autofit = False
+        for rw in bt.rows:
+            rw.cells[0].width = Inches(0.5); rw.cells[1].width = Inches(6.5)
+
     buf = io.BytesIO(); doc.save(buf)
     return _fix_zoom(buf.getvalue())
