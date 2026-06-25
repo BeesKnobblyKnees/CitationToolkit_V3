@@ -345,7 +345,7 @@ if uploaded:
     # ── Page / chapter filter ──────────────────────────────────────────────
     if src_ext == '.pdf':
         _doc = fitz.open(stream=src_bytes, filetype="pdf")
-        _total_pages = len(_doc.pages)
+        _total_pages = _doc.page_count
         _doc.close()
         st.caption(f"{uploaded.name} — {_total_pages} pages")
 
@@ -482,7 +482,7 @@ if st.session_state.fe_scanned and st.session_state.fe_figures:
             pdf_for_crop = st.session_state.fe_pdf_bytes if st.session_state.fe_src_type=='.pdf' else None
             with st.spinner("Cropping and building documents…"):
                 try:
-                    caps = st.session_state.fe_captions
+                    caps = {k: _xml_safe(v) for k, v in st.session_state.fe_captions.items()}
                     pdf_out  = build_pdf(figs, caps, pdf_bytes=pdf_for_crop)
                     word_out = build_word(figs, caps, pdf_bytes=pdf_for_crop)
                     stem = Path(st.session_state.fe_src_name).stem
