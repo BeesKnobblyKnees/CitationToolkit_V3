@@ -87,38 +87,71 @@ def pdf_image_boxes(pdf_bytes, page_num, dpi=200):
     doc   = fitz.open(stream=pdf_bytes, filetype="pdf")
     page  = doc[page_num]
     scale = dpi/72
+    pw, ph = page.rect.width, page.rect.height
     boxes = []
-    for img_info in page.get_images(full=True):
-        for rect in page.get_image_rects(img_info[0]):
-            boxes.append((int(rect.x0*scale), int(rect.y0*scale),
-                          int(rect.x1*scale), int(rect.y1*scale)))
+    for blk in page.get_text("dict").get("blocks", []):
+        if blk.get("type") != 1:          # 1 = raster image block
+            continue
+        x0, y0, x1, y1 = blk["bbox"]
+        w, h = x1 - x0, y1 - y0
+        if w > pw*0.60 and h < ph*0.06:   # header banner strip
+            continue
+        if w < 40 or h < 40:              # slivers, rules, page-number marks
+            continue
+        boxes.append((int(x0*scale), int(y0*scale), int(x1*scale), int(y1*scale)))
     doc.close()
     return boxes
 
 def pdf_caption_y(pdf_bytes, page_num, search_text, dpi=200):
-    doc   = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page  = doc[page_num]
-    rects = page.search_for(search_text[:50].strip())
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_num]
+    lm = re.match(r'(Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*([0-9][\w\-\.]*)',
+                  search_text, re.IGNORECASE)
+    y = None
+    if lm:
+        kind = lm.group(1).rstrip('.')
+        num  = lm.group(2).rstrip('.')
+        pat  = re.compile(r'^\s*' + re.escape(kind) + r'\.?\s*' +
+                          re.escape(num) + r'[\.\s]', re.IGNORECASE)
+        for b in page.get_text("blocks"):
+            if pat.match(b[4].strip()):
+                y = b[1]                  # y0 of the legend block
+                break
+    if y is None:
+        rects = page.search_for(search_text[:50].strip())
+        if rects:
+            y = rects[0].y0
     doc.close()
-    if rects:
-        return int(rects[0].y0 * dpi/72)
-    return None
+    return int(y * dpi/72) if y is not None else None
 
 def pdf_extract_caption(pdf_bytes, page_num, label_text):
     doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[page_num]
-    text = page.get_text("text")
+    blocks = page.get_text("blocks")
     doc.close()
-    idx = text.lower().find(label_text.lower()[:30])
-    if idx == -1:
+    lm = re.match(r'(Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*([0-9][\w\-\.]*)',
+                  label_text, re.IGNORECASE)
+    if not lm:
         return label_text
-    chunk = text[idx:]
-    end = re.search(
-        r'\n\n|\n(?=(?:Fig(?:ure)?\.?\s*\d|Table\s*\d|Box\s*\d|Plate\s*\d|Video\s*\d))',
-        chunk, re.IGNORECASE)
-    if end:
-        chunk = chunk[:end.start()]
-    return re.sub(r'\s{2,}', ' ', re.sub(r'\n+', ' ', chunk)).strip()
+    kind = lm.group(1).rstrip('.')
+    num  = lm.group(2).rstrip('.')
+    pat  = re.compile(r'^\s*' + re.escape(kind) + r'\.?\s*' +
+                      re.escape(num) + r'[\.\s]', re.IGNORECASE)
+    cap = None
+    for b in blocks:
+        if pat.match(b[4].strip()):
+            cap = b[4].strip()
+            break
+    if cap is None:
+        return label_text
+    cap = re.sub(r'\s+', ' ', cap).strip()
+    nxt = re.search(r'(?<=\w)\s+(?:Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*[0-9]', cap)
+    if nxt:
+        cap = cap[:nxt.start()].strip()
+    if len(cap) > 600:
+        cut = cap.rfind('. ', 0, 600)
+        cap = cap[:cut+1] if cut > 60 else cap[:600]
+    return cap
 
 def pdf_scan(pdf_bytes, dpi=200, page_filter=None):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
