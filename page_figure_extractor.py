@@ -283,6 +283,24 @@ def build_pdf(figures, captions, pdf_bytes=None):
                       topMargin=MARGIN, bottomMargin=MARGIN).build(story)
     buf.seek(0); return buf.read()
 
+import re
+_BAD_XML_CHARS = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufdd0-\ufddf\ufffe\uffff]')
+def _xml_safe(s):
+    if s is None:
+        return ''
+    if not isinstance(s, str):
+        s = str(s)
+    return _BAD_XML_CHARS.sub('', s)
+
+import re
+_BAD_XML_CHARS = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufdd0-\ufddf\ufffe\uffff]')
+def _xml_safe(s):
+    if s is None:
+        return ''
+    if not isinstance(s, str):
+        s = str(s)
+    return _BAD_XML_CHARS.sub('', s)
+
 def build_word(figures, captions, pdf_bytes=None):
     doc     = Document()
     section = doc.sections[0]
@@ -297,9 +315,10 @@ def build_word(figures, captions, pdf_bytes=None):
         iw, ih = cropped.size; asp = iw/ih
         cap_text = captions.get(fig['label'], fig['caption'])
         cap_h    = max(1, len(cap_text)//90+1)*14/72+0.2
-        max_h    = ch - cap_h - 0.3
+        max_h    = max(0.5, ch - cap_h - 0.3)
         dw = min(cw, iw/OUT_DPI); dh = dw/asp
         if dh > max_h: dh = max_h; dw = dh*asp
+        dw = max(0.5, min(dw, cw))
         p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.space_before = Pt(6); p.paragraph_format.space_after = Pt(6)
         p.add_run().add_picture(io.BytesIO(img_to_bytes(cropped)), width=Inches(dw))
