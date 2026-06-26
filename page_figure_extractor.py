@@ -305,6 +305,7 @@ def build_word(figures, captions, pdf_bytes=None):
         p.add_run().add_picture(io.BytesIO(img_to_bytes(cropped)), width=Inches(dw))
         cp = doc.add_paragraph(); cp.alignment = WD_ALIGN_PARAGRAPH.LEFT
         cp.paragraph_format.space_before = Pt(4); cp.paragraph_format.space_after = Pt(4)
+        cap_text = _xml_safe(cap_text)
         m2 = re.match(r'^((?:Fig(?:ure)?\.?\s*\d+[\w\-\.]*|Table\s*\d+[\w\-\.]*|'
                       r'Box\s*\d+[\w\-\.]*|Plate\s*\d+[\w\-\.]*|Video\s*\d+[\w\-\.]*)'
                       r'\.?\s*)', cap_text, re.IGNORECASE)
