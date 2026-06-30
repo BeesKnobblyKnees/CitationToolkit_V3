@@ -192,15 +192,6 @@ def pdf_extract_caption(pdf_bytes, page_num, label_text):
         cap = cap[:cut+1] if cut > 60 else cap[:600]
     return clean_caption(cap)
 
-def pdf_printed_page(pdf_bytes, page_num):
-    try:
-        d = fitz.open(stream=pdf_bytes, filetype='pdf')
-        head = d[page_num].get_text('text')[:200]; d.close()
-        nums = re.findall(r'\b(\d{2,4})\b', head)
-        return nums[-1] if nums else None
-    except Exception:
-        return None
-
 def pdf_scan(pdf_bytes, dpi=200, page_filter=None):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total = len(doc); doc.close()
@@ -231,7 +222,6 @@ def pdf_scan(pdf_bytes, dpi=200, page_filter=None):
                 img_boxes=pdf_image_boxes(pdf_bytes, pn, dpi),
                 caption_y=pdf_caption_y(pdf_bytes, pn, label, dpi),
                 include=True, crop_top=0, crop_bot=0,
-                book_page=pdf_printed_page(pdf_bytes, pn),
             ))
     bar.empty()
     return figures
@@ -268,7 +258,7 @@ def docx_scan(docx_bytes):
             if len(t) > 20:
                 cap_parts.append(t); break
         caption = re.sub(r'\s{2,}', ' ', ' '.join(cap_parts)).strip() or f"Figure {len(figures)+1}"
-        caption = clean_caption(caption)
+    caption = clean_caption(caption)
         lm = CAPTION_RE.match(caption)
         f_type = 'Figure'; f_num = str(len(figures)+1)
         if lm:
@@ -380,11 +370,7 @@ def build_pdf(figures, captions, pdf_bytes=None):
         head_sty = ParagraphStyle('VH', fontName='Times-Bold', fontSize=13, leading=18, spaceAfter=10)
         story.append(Paragraph('Videos', head_sty))
         for v in _vids:
-            if v.get('source')!='docx' and v.get('page_num') is not None:
-                _bp = v.get('book_page')
-                _pg = f" — PDF page {v['page_num']+1}" + (f", printed book page {_bp}" if _bp else '')
-            else:
-                _pg = ''
+            _pg = f" — Page {v['page_num']+1}" if v.get('source')!='docx' and v.get('page_num') is not None else ''
             story.append(Paragraph(cap_html(v['label'] + _pg), cap_sty))
     SimpleDocTemplate(buf, pagesize=letter,
                       leftMargin=MARGIN, rightMargin=MARGIN,
@@ -448,11 +434,7 @@ def build_word(figures, captions, pdf_bytes=None):
         h = doc.add_paragraph(); hr = h.add_run('Videos')
         hr.bold = True; hr.font.name = 'Times New Roman'; hr.font.size = Pt(13)
         for v in _vids:
-            if v.get('source')!='docx' and v.get('page_num') is not None:
-                _bp = v.get('book_page')
-                _pg = f" \u2014 PDF page {v['page_num']+1}" + (f", printed book page {_bp}" if _bp else '')
-            else:
-                _pg = ''
+            _pg = f" \u2014 Page {v['page_num']+1}" if v.get('source')!='docx' and v.get('page_num') is not None else ''
             vp = doc.add_paragraph(); vr = vp.add_run(_xml_safe(v['label'] + _pg))
             vr.font.name = 'Times New Roman'; vr.font.size = Pt(10)
     buf = io.BytesIO(); doc.save(buf); buf.seek(0); return buf.read()
@@ -468,15 +450,6 @@ def _caption_path(project):
 def fe_save_captions(project, caps):
     _CROPDIR.mkdir(exist_ok=True)
     _caption_path(project).write_text(json.dumps(caps or {}, indent=1, ensure_ascii=False))
-def fe_recent_projects():
-    if not _CROPDIR.exists(): return []
-    items = []
-    for p in _CROPDIR.glob('*.json'):
-        n = p.name
-        if n.endswith('.scan.json') or n.endswith('.captions.json'): continue
-        items.append((p.stat().st_mtime, p.stem))
-    items.sort(reverse=True)
-    return [name for _, name in items]
 def fe_load_captions(project):
     p = _caption_path(project)
     if p.exists():
@@ -664,26 +637,16 @@ if uploaded:
 if st.session_state.fe_scanned and st.session_state.fe_figures:
     _pc1, _pc2, _pc3, _pc4 = st.columns([3,1,1,2])
     with _pc1:
-        _recent = fe_recent_projects()
-        if _recent:
-            _pick = st.selectbox("Recent projects", ["— current —"] + _recent, index=0, key="fe_recent_pick")
-            if _pick != "— current —" and _pick != st.session_state.fe_project:
-                st.session_state.fe_project = _pick
-                _sv = fe_load_crops(_pick); fe_apply_saved(st.session_state.fe_figures, _sv)
-                st.session_state.fe_captions = fe_load_captions(_pick) or {}
-                for _i2 in range(len(st.session_state.fe_figures)):
-                    st.session_state.pop(f"fe_pts_{_i2}", None)
-                st.rerun()
         _proj = st.text_input("Project name (crops save under this)", value=st.session_state.fe_project, key="fe_proj_in")
         if _proj != st.session_state.fe_project:
             st.session_state.fe_project = _proj; st.rerun()
     with _pc2:
-        if st.button("Save all", key="fe_saveall"):
+        if st.button("💾 Save all", key="fe_saveall"):
             _c = fe_save_crops(st.session_state.fe_project, st.session_state.fe_figures)
             fe_save_captions(st.session_state.fe_project, st.session_state.fe_captions)
             st.success(f"Saved {_c} crop(s) + captions.")
     with _pc3:
-        if st.button("Restore", key="fe_restore"):
+        if st.button("↺ Restore", key="fe_restore"):
             _sv = fe_load_crops(st.session_state.fe_project)
             _c = fe_apply_saved(st.session_state.fe_figures, _sv)
             for _i2 in range(len(st.session_state.fe_figures)):
@@ -726,7 +689,7 @@ if st.session_state.fe_scanned and st.session_state.fe_figures:
         included = fig.get('include',True)
         chk_col, content_col = st.columns([1,11])
         with chk_col:
-            inc = st.checkbox("include", value=included, key=f"fe_inc_{i}", label_visibility="collapsed")
+            inc = st.checkbox("", value=included, key=f"fe_inc_{i}")
             if inc != included: figs[i]['include']=inc; st.rerun()
         with content_col:
             st.markdown(f"**{fig['label']}** — "
