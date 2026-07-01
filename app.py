@@ -75,17 +75,6 @@ elif page == "context_transplant": exec(open("page_context_transplant.py").read(
 # ── Final expander fix (must be last so it wins the cascade) ──────────────────
 st.markdown("""
 <style>
-/* Kill the text-indent trick + un-squeeze the label container */
-.eqw31fm4 { text-indent: 0 !important; min-height: 0 !important; height: auto !important; }
-.eqw31fm4::before { display: none !important; content: none !important; }
-.eqw31fm2 {
-  text-indent: 0 !important;
-  width: 100% !important;
-  min-width: 0 !important;
-  white-space: normal !important;
-  overflow: visible !important;
-}
-.eqw31fm3 { text-indent: 0 !important; white-space: normal !important; }
 /* The arrow icon that leaks "_arr": hide the stray text, keep a real svg if present */
 .epifhcv2 { font-size: 0 !important; color: transparent !important; }
 .epifhcv2 svg { width: 16px !important; height: 16px !important; font-size: 1rem !important;
