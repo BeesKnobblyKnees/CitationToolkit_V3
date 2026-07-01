@@ -478,12 +478,6 @@ button[kind="secondary"], .stButton > button[kind="secondary"] {
   font-family: 'Source Sans 3', sans-serif !important;
   font-size: 0.84rem !important;
 }
-/* secondary button labels: dark ink, not cream (fixes cream-on-cream) */
-button[kind="secondary"] p, button[kind="secondary"] span,
-.stButton > button[kind="secondary"] p, .stButton > button[kind="secondary"] span,
-.stButton > button[kind="secondary"] div {
-  color: var(--ink-mid) !important;
-}
 button[kind="secondary"]:hover {
   border-color: var(--accent) !important;
   color: var(--accent) !important;
@@ -1252,12 +1246,6 @@ button[kind="secondary"], .stButton > button[kind="secondary"] {
   color: var(--ink-mid) !important;
   font-family: 'Source Sans 3', sans-serif !important;
   font-size: 0.84rem !important;
-}
-/* secondary button labels: dark ink, not cream (fixes cream-on-cream) */
-button[kind="secondary"] p, button[kind="secondary"] span,
-.stButton > button[kind="secondary"] p, .stButton > button[kind="secondary"] span,
-.stButton > button[kind="secondary"] div {
-  color: var(--ink-mid) !important;
 }
 button[kind="secondary"]:hover {
   border-color: var(--accent) !important;

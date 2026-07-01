@@ -1,0 +1,826 @@
+"""
+Figure Extractor — page module for Citation Toolkit v3.
+Extracts figures, tables, boxes, and plates from PDF or Word source files.
+Outputs: PDF (one figure per page) AND Word document.
+"""
+import io, re, os, tempfile
+from pathlib import Path
+
+import streamlit as st
+from streamlit_image_coordinates import streamlit_image_coordinates
+from shared import APP_CSS
+
+st.markdown(APP_CSS, unsafe_allow_html=True)
+st.markdown('<div class="app-label">A practical group &nbsp; 6 of 6</div>',
+            unsafe_allow_html=True)
+st.markdown("## Figure *Extractor*")
+st.markdown(
+    "Extract figures, tables, boxes, and plates from a published PDF or Word file. "
+    "Outputs a **PDF** and **Word document** — one figure per page, clean crop, exact caption."
+)
+st.divider()
+
+# ── dependency check ──────────────────────────────────────────────────────────
+missing_deps = []
+try:
+    import fitz
+except ImportError:
+    missing_deps.append("PyMuPDF  →  pip3 install pymupdf")
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    missing_deps.append("Pillow  →  pip3 install Pillow")
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.platypus import (SimpleDocTemplate, Image as RLImage,
+                                    Paragraph, Spacer, PageBreak)
+except ImportError:
+    missing_deps.append("ReportLab  →  pip3 install reportlab")
+
+if missing_deps:
+    st.error("Some packages need to be installed before this tool can run.")
+    st.markdown("**Run these commands in Terminal, then restart the app:**")
+    for d in missing_deps:
+        st.code(f"pip3 install {d.split('→')[1].strip()}", language="bash")
+    st.stop()
+
+# ── imports (safe after check) ────────────────────────────────────────────────
+import fitz
+from PIL import Image, ImageOps
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_LEFT
+from reportlab.platypus import (SimpleDocTemplate, Image as RLImage,
+                                 Paragraph, Spacer, PageBreak)
+
+# ── constants ─────────────────────────────────────────────────────────────────
+SCAN_DPI   = 200
+OUT_DPI    = 300
+PAGE_W     = 8.5  * inch
+PAGE_H     = 11.0 * inch
+MARGIN     = 0.75 * inch
+CONTENT_W  = PAGE_W - 2 * MARGIN
+CONTENT_H  = PAGE_H - 2 * MARGIN
+
+CAPTION_RE = re.compile(
+    r'(?:^|\n)\s*((?:Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*\d+[\w\-\.]*)',
+    re.IGNORECASE
+)
+
+# ── PDF helpers ───────────────────────────────────────────────────────────────
+def pdf_render(pdf_bytes, page_num, dpi=200):
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_num]
+    mat  = fitz.Matrix(dpi/72, dpi/72)
+    pix  = page.get_pixmap(matrix=mat, alpha=False)
+    img  = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    doc.close()
+    return img
+
+def pdf_image_boxes(pdf_bytes, page_num, dpi=200):
+    doc   = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page  = doc[page_num]
+    scale = dpi/72
+    pw, ph = page.rect.width, page.rect.height
+    boxes = []
+    for blk in page.get_text("dict").get("blocks", []):
+        if blk.get("type") != 1:          # 1 = raster image block
+            continue
+        x0, y0, x1, y1 = blk["bbox"]
+        w, h = x1 - x0, y1 - y0
+        if w > pw*0.60 and h < ph*0.06:   # header banner strip
+            continue
+        if w < 40 or h < 40:              # slivers, rules, page-number marks
+            continue
+        boxes.append((int(x0*scale), int(y0*scale), int(x1*scale), int(y1*scale)))
+    doc.close()
+    return boxes
+
+def pdf_caption_y(pdf_bytes, page_num, search_text, dpi=200):
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_num]
+    lm = re.match(r'(Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*([0-9][\w\-\.]*)',
+                  search_text, re.IGNORECASE)
+    y = None
+    if lm:
+        kind = lm.group(1).rstrip('.')
+        num  = lm.group(2).rstrip('.')
+        pat  = re.compile(r'^\s*' + re.escape(kind) + r'\.?\s*' +
+                          re.escape(num) + r'[\.\s]', re.IGNORECASE)
+        for b in page.get_text("blocks"):
+            if pat.match(b[4].strip()):
+                y = b[1]                  # y0 of the legend block
+                break
+    if y is None:
+        rects = page.search_for(search_text[:50].strip())
+        if rects:
+            y = rects[0].y0
+    doc.close()
+    return int(y * dpi/72) if y is not None else None
+
+def clean_caption(s):
+    if not s: return s
+    s = s.replace('\u00ad ', '').replace('\u00ad', '')   # soft hyphen: rejoin split words
+    s = s.replace('\x07', '').replace('\ufffe', '').replace('\uffff', '')
+    s = re.sub(r'\s+', ' ', s).strip()
+    s = re.sub(r'(?:\s+[A-Z]){2,}$', '', s).strip()        # drop trailing panel letters (A B C)
+    return s
+
+def pdf_extract_caption(pdf_bytes, page_num, label_text):
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_num]
+    blocks = page.get_text("blocks")
+    rdict  = page.get_text("dict")
+    doc.close()
+    lm = re.match(r'(Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*([0-9][\w\-\.]*)',
+                  label_text, re.IGNORECASE)
+    if not lm:
+        return clean_caption(label_text)
+    kind = lm.group(1).rstrip('.')
+    num  = lm.group(2).rstrip('.')
+    is_table = kind.lower() in ('table', 'box', 'plate')
+    pat  = re.compile(r'^\s*' + re.escape(kind) + r'\.?\s*' +
+                      re.escape(num) + r'[\.\s\u0007]', re.IGNORECASE)
+    nextpat = re.compile(r'^\s*(Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*[0-9]', re.IGNORECASE)
+
+    cap = None
+    for b in blocks:
+        if pat.match(b[4].strip()):
+            cap = b[4].strip(); break
+
+    # Fallback / table titles: line-based scan (handles mid-block legends and wrapped titles)
+    def label_only(c):
+        return (not c) or re.fullmatch(r'(Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*[0-9][\w\-\.]*\.?',
+                                       c.strip(), re.IGNORECASE) is not None
+    if cap is None or label_only(cap) or is_table:
+        lines = []
+        for blk in rdict["blocks"]:
+            if blk.get("type") != 0: continue
+            for ln in blk["lines"]:
+                txt = " ".join(s["text"] for s in ln["spans"])
+                lines.append((round(ln["bbox"][1]), round(ln["bbox"][0]),
+                              ln["bbox"][3], txt))
+        lines.sort(key=lambda r: (r[0], r[1]))
+        start = next((i for i,(_,_,_,t) in enumerate(lines) if pat.match(t)), None)
+        if start is not None:
+            collected = [lines[start][3]]
+            prev_bottom = lines[start][2]
+            for j in range(start+1, min(start+14, len(lines))):
+                t = lines[j][3]
+                if nextpat.match(t): break
+                if lines[j][0] - prev_bottom > 26: break     # big vertical gap = end of caption
+                collected.append(t); prev_bottom = lines[j][2]
+            line_cap = " ".join(collected).strip()
+            if cap is None or len(line_cap) > len(cap):
+                cap = line_cap
+
+    if cap is None:
+        return clean_caption(label_text)
+    cap = re.sub(r'\s+', ' ', cap).strip()
+    nxt = re.search(r'(?<=\w)\s+(?:Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*[0-9]', cap)
+    if nxt:
+        cap = cap[:nxt.start()].strip()
+    if len(cap) > 600:
+        cut = cap.rfind('. ', 0, 600)
+        cap = cap[:cut+1] if cut > 60 else cap[:600]
+    return clean_caption(cap)
+
+def pdf_printed_page(pdf_bytes, page_num):
+    try:
+        d = fitz.open(stream=pdf_bytes, filetype='pdf')
+        head = d[page_num].get_text('text')[:200]; d.close()
+        nums = re.findall(r'\b(\d{2,4})\b', head)
+        return nums[-1] if nums else None
+    except Exception:
+        return None
+
+def pdf_scan(pdf_bytes, dpi=200, page_filter=None):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total = len(doc); doc.close()
+    pages_to_scan = sorted(page_filter) if page_filter else list(range(total))
+    figures = []; seen = set()
+    bar = st.progress(0, text="Scanning pages…")
+    for idx, pn in enumerate(pages_to_scan):
+        bar.progress((idx+1)/len(pages_to_scan),
+                     text=f"Scanning page {pn+1} ({idx+1}/{len(pages_to_scan)})…")
+        doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = doc[pn].get_text("text")
+        doc.close()
+        for m in CAPTION_RE.finditer(text):
+            label = m.group(1).strip()
+            norm  = re.sub(r'\s+', ' ', label.upper())
+            if norm in seen: continue
+            seen.add(norm)
+            lm = re.match(r'(Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*(\d+[\w\-\.]*)',
+                          label, re.IGNORECASE)
+            f_type = lm.group(1).rstrip('.').title() if lm else 'Figure'
+            f_num  = lm.group(2) if lm else '?'
+            figures.append(dict(
+                source='pdf', page_num=pn,
+                fig_type=f_type, fig_num=f_num,
+                label=f"{f_type} {f_num}",
+                caption=pdf_extract_caption(pdf_bytes, pn, label),
+                page_img=pdf_render(pdf_bytes, pn, dpi),
+                img_boxes=pdf_image_boxes(pdf_bytes, pn, dpi),
+                caption_y=pdf_caption_y(pdf_bytes, pn, label, dpi),
+                include=True, crop_top=0, crop_bot=0,
+                book_page=pdf_printed_page(pdf_bytes, pn),
+            ))
+    bar.empty()
+    return figures
+
+# ── Word helpers ──────────────────────────────────────────────────────────────
+def docx_scan(docx_bytes):
+    import zipfile
+    from lxml import etree
+    doc   = Document(io.BytesIO(docx_bytes))
+    paras = doc.paragraphs
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+        rels_xml = z.read('word/_rels/document.xml.rels')
+        media    = {n for n in z.namelist() if n.startswith('word/media/')}
+    rels_root = etree.fromstring(rels_xml)
+    rel_map   = {r.get('Id',''): 'word/'+r.get('Target','')
+                 for r in rels_root if r.get('Target','').startswith('media/')}
+    figures = []; seen = set()
+    for pi, para in enumerate(paras):
+        p_xml    = para._p.xml
+        img_rids = [rid for rid, path in rel_map.items()
+                    if rid in p_xml and path in media]
+        if not img_rids: continue
+        cap_parts = []
+        for j in range(pi+1, min(pi+8, len(paras))):
+            t = paras[j].text.strip()
+            if not t: continue
+            if CAPTION_RE.match(t):
+                cap_parts.append(t)
+                for k in range(j+1, min(j+6, len(paras))):
+                    kt = paras[k].text.strip()
+                    if not kt or CAPTION_RE.match(kt): break
+                    cap_parts.append(kt)
+                break
+            if len(t) > 20:
+                cap_parts.append(t); break
+        caption = re.sub(r'\s{2,}', ' ', ' '.join(cap_parts)).strip() or f"Figure {len(figures)+1}"
+        caption = clean_caption(caption)
+        lm = CAPTION_RE.match(caption)
+        f_type = 'Figure'; f_num = str(len(figures)+1)
+        if lm:
+            lm2 = re.match(r'(Fig(?:ure)?\.?|Table|Box|Plate|Video)\s*(\d+[\w\-\.]*)',
+                           lm.group(1).strip(), re.IGNORECASE)
+            if lm2: f_type = lm2.group(1).rstrip('.').title(); f_num = lm2.group(2)
+        norm = re.sub(r'\s+',' ', f"{f_type} {f_num}".upper())
+        if norm in seen: continue
+        seen.add(norm)
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+            raw = z.read(rel_map[img_rids[0]])
+        try: pil = Image.open(io.BytesIO(raw)).convert('RGB')
+        except: continue
+        figures.append(dict(
+            source='docx', page_num=pi,
+            fig_type=f_type, fig_num=f_num,
+            label=f"{f_type} {f_num}", caption=caption,
+            page_img=pil, img_bytes=raw,
+            img_boxes=[], caption_y=None,
+            include=True, crop_top=0, crop_bot=0,
+        ))
+    return figures
+
+# ── cropping ──────────────────────────────────────────────────────────────────
+def smart_crop(page_img, img_boxes, caption_y_px, crop_top_pct=0, crop_bot_pct=0, pad=20):
+    w, h = page_img.size
+    manual_top = int(h * crop_top_pct/100)
+    manual_bot = h - int(h * crop_bot_pct/100)
+    if img_boxes:
+        above = [b for b in img_boxes if b[3] <= (caption_y_px or h)+30] or img_boxes
+        x0 = max(0, min(b[0] for b in above)-pad)
+        y0 = max(manual_top, min(b[1] for b in above)-pad)
+        x1 = min(w, max(b[2] for b in above)+pad)
+        y1 = min(manual_bot, (caption_y_px-pad) if caption_y_px else max(b[3] for b in above)+pad)
+        return page_img.crop((x0, y0, x1, max(y0+10, y1)))
+    elif caption_y_px:
+        return page_img.crop((0, manual_top, w, max(manual_top+10, caption_y_px-pad)))
+    return page_img.crop((0, manual_top, w, manual_bot))
+
+def get_cropped(fig, pdf_bytes=None):
+    if fig['source'] == 'docx':
+        img = Image.open(io.BytesIO(fig['img_bytes'])).convert('RGB')
+    else:
+        img = pdf_render(pdf_bytes, fig['page_num'], dpi=OUT_DPI)
+    W, H = img.size
+
+    if fig.get('manual_box'):
+        l = int(W * fig.get('crop_left', 0)/100)
+        t = int(H * fig.get('crop_top',  0)/100)
+        r = W - int(W * fig.get('crop_right',0)/100)
+        b = H - int(H * fig.get('crop_bot',  0)/100)
+        cropped = img.crop((max(0,l), max(0,t), min(W,max(l+10,r)), min(H,max(t+10,b))))
+        return ImageOps.autocontrast(cropped, cutoff=0.5)
+
+    if fig['source'] == 'docx':
+        top = int(H*fig['crop_top']/100); bot = H-int(H*fig['crop_bot']/100)
+        if top > 0 or bot < H: img = img.crop((0, top, W, bot))
+        return ImageOps.autocontrast(img, cutoff=0.5)
+
+    img_boxes = pdf_image_boxes(pdf_bytes, fig['page_num'], dpi=OUT_DPI)
+    cap_y = int(fig['caption_y'] * OUT_DPI/SCAN_DPI) if fig['caption_y'] else None
+    cropped = smart_crop(img, img_boxes, cap_y, fig['crop_top'], fig['crop_bot'])
+    cropped = ImageOps.autocontrast(cropped, cutoff=0.5)
+    try:
+        bbox = ImageOps.invert(cropped.convert('L')).getbbox()
+        if bbox:
+            bw, bh = cropped.size; p = 15
+            cropped = cropped.crop((max(0,bbox[0]-p), max(0,bbox[1]-p),
+                                    min(bw,bbox[2]+p), min(bh,bbox[3]+p)))
+    except: pass
+    return cropped
+
+def img_to_bytes(img):
+    buf = io.BytesIO(); img.save(buf, format='PNG', dpi=(OUT_DPI,OUT_DPI)); buf.seek(0)
+    return buf.read()
+
+# ── output builders ───────────────────────────────────────────────────────────
+def cap_html(text):
+    m = re.match(r'^((?:Fig(?:ure)?\.?\s*\d+[\w\-\.]*|Table\s*\d+[\w\-\.]*|'
+                 r'Box\s*\d+[\w\-\.]*|Plate\s*\d+[\w\-\.]*|Video\s*\d+[\w\-\.]*)'
+                 r'\.?\s*)', text, re.IGNORECASE)
+    if m: return f'<b>{m.group(1)}</b>{text[len(m.group(1)):]}'
+    return text
+
+def build_pdf(figures, captions, pdf_bytes=None):
+    buf = io.BytesIO()
+    cap_sty = ParagraphStyle('C', fontName='Times-Roman', fontSize=10,
+                              leading=14, alignment=TA_LEFT, spaceAfter=6)
+    story = []
+    _vids = [f for f in figures if f.get('include',True) and (f.get('source')=='video' or f.get('fig_type','').lower()=='video')]
+    _items = [f for f in figures if f.get('include',True) and f not in _vids]
+    for idx, fig in enumerate(_items):
+        if idx > 0: story.append(PageBreak())
+        try: cropped = get_cropped(fig, pdf_bytes)
+        except: continue
+        img_w, img_h = cropped.size; asp = img_w/img_h
+        cap_text = captions.get(fig['label'], fig['caption'])
+        cap_h    = max(1, len(cap_text)//90+1) * 14/72*inch + 0.2*inch
+        max_h    = CONTENT_H - cap_h - 0.3*inch
+        dw = min(CONTENT_W, img_w/OUT_DPI*inch); dh = dw/asp
+        if dh > max_h: dh = max_h; dw = dh*asp
+        top_sp = (CONTENT_H - dh - cap_h) / 2
+        if top_sp > 0: story.append(Spacer(1, top_sp))
+        story.append(RLImage(io.BytesIO(img_to_bytes(cropped)), width=dw, height=dh))
+        story.append(Spacer(1, 0.15*inch))
+        story.append(Paragraph(cap_html(cap_text), cap_sty))
+    if _vids:
+        if story: story.append(PageBreak())
+        head_sty = ParagraphStyle('VH', fontName='Times-Bold', fontSize=13, leading=18, spaceAfter=10)
+        story.append(Paragraph('Videos', head_sty))
+        for v in _vids:
+            if v.get('source')!='docx' and v.get('page_num') is not None:
+                _bp = v.get('book_page')
+                _pg = f" — PDF page {v['page_num']+1}" + (f", printed book page {_bp}" if _bp else '')
+            else:
+                _pg = ''
+            story.append(Paragraph(cap_html(v['label'] + _pg), cap_sty))
+    SimpleDocTemplate(buf, pagesize=letter,
+                      leftMargin=MARGIN, rightMargin=MARGIN,
+                      topMargin=MARGIN, bottomMargin=MARGIN).build(story)
+    buf.seek(0); return buf.read()
+
+import re
+_BAD_XML_CHARS = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufdd0-\ufddf\ufffe\uffff]')
+def _xml_safe(s):
+    if s is None:
+        return ''
+    if not isinstance(s, str):
+        s = str(s)
+    return _BAD_XML_CHARS.sub('', s)
+
+import re
+_BAD_XML_CHARS = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufdd0-\ufddf\ufffe\uffff]')
+def _xml_safe(s):
+    if s is None:
+        return ''
+    if not isinstance(s, str):
+        s = str(s)
+    return _BAD_XML_CHARS.sub('', s)
+
+def build_word(figures, captions, pdf_bytes=None):
+    doc     = Document()
+    section = doc.sections[0]
+    section.page_width  = int(8.5*914400); section.page_height = int(11.0*914400)
+    m = int(0.75*914400)
+    section.top_margin = section.bottom_margin = section.left_margin = section.right_margin = m
+    cw = 8.5-1.5; ch = 11.0-1.5
+    _vids = [f for f in figures if f.get('include',True) and (f.get('source')=='video' or f.get('fig_type','').lower()=='video')]
+    _items = [f for f in figures if f.get('include',True) and f not in _vids]
+    for idx, fig in enumerate(_items):
+        if idx > 0: doc.add_page_break()
+        try: cropped = get_cropped(fig, pdf_bytes)
+        except: continue
+        iw, ih = cropped.size; asp = iw/ih
+        cap_text = captions.get(fig['label'], fig['caption'])
+        cap_h    = max(1, len(cap_text)//90+1)*14/72+0.2
+        max_h    = max(0.5, ch - cap_h - 0.3)
+        dw = min(cw, iw/OUT_DPI); dh = dw/asp
+        if dh > max_h: dh = max_h; dw = dh*asp
+        dw = max(0.5, min(dw, cw))
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_before = Pt(6); p.paragraph_format.space_after = Pt(6)
+        p.add_run().add_picture(io.BytesIO(img_to_bytes(cropped)), width=Inches(dw))
+        cp = doc.add_paragraph(); cp.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        cp.paragraph_format.space_before = Pt(4); cp.paragraph_format.space_after = Pt(4)
+        cap_text = _xml_safe(cap_text)
+        m2 = re.match(r'^((?:Fig(?:ure)?\.?\s*\d+[\w\-\.]*|Table\s*\d+[\w\-\.]*|'
+                      r'Box\s*\d+[\w\-\.]*|Plate\s*\d+[\w\-\.]*|Video\s*\d+[\w\-\.]*)'
+                      r'\.?\s*)', cap_text, re.IGNORECASE)
+        if m2:
+            br = cp.add_run(m2.group(1)); br.bold=True; br.font.name='Times New Roman'; br.font.size=Pt(10)
+            rr = cp.add_run(cap_text[len(m2.group(1)):]); rr.font.name='Times New Roman'; rr.font.size=Pt(10)
+        else:
+            r = cp.add_run(cap_text); r.font.name='Times New Roman'; r.font.size=Pt(10)
+    if _vids:
+        doc.add_page_break()
+        h = doc.add_paragraph(); hr = h.add_run('Videos')
+        hr.bold = True; hr.font.name = 'Times New Roman'; hr.font.size = Pt(13)
+        for v in _vids:
+            if v.get('source')!='docx' and v.get('page_num') is not None:
+                _bp = v.get('book_page')
+                _pg = f" \u2014 PDF page {v['page_num']+1}" + (f", printed book page {_bp}" if _bp else '')
+            else:
+                _pg = ''
+            vp = doc.add_paragraph(); vr = vp.add_run(_xml_safe(v['label'] + _pg))
+            vr.font.name = 'Times New Roman'; vr.font.size = Pt(10)
+    buf = io.BytesIO(); doc.save(buf); buf.seek(0); return buf.read()
+
+import json
+_CROPDIR = Path(__file__).parent / "crops"
+def _crop_path(project):
+    safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', (project or 'default')).strip('_') or 'default'
+    return _CROPDIR / f"{safe}.json"
+def _caption_path(project):
+    safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', (project or 'default')).strip('_') or 'default'
+    return _CROPDIR / f"{safe}.captions.json"
+def fe_save_captions(project, caps):
+    _CROPDIR.mkdir(exist_ok=True)
+    _caption_path(project).write_text(json.dumps(caps or {}, indent=1, ensure_ascii=False))
+def fe_recent_projects():
+    if not _CROPDIR.exists(): return []
+    items = []
+    for p in _CROPDIR.glob('*.json'):
+        n = p.name
+        if n.endswith('.scan.json') or n.endswith('.captions.json'): continue
+        items.append((p.stat().st_mtime, p.stem))
+    items.sort(reverse=True)
+    return [name for _, name in items]
+def fe_load_captions(project):
+    p = _caption_path(project)
+    if p.exists():
+        try: return json.loads(p.read_text())
+        except Exception: return {}
+    return {}
+def _scan_path(project):
+    safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', (project or 'default')).strip('_') or 'default'
+    return _CROPDIR / f"{safe}.scan.json"
+_SCAN_DROP = ('page_img', 'img_boxes')
+def fe_save_scan(project, page_count, figs):
+    _CROPDIR.mkdir(exist_ok=True)
+    out = []
+    for f in figs:
+        g = {k: v for k, v in f.items() if k not in _SCAN_DROP}
+        if g.get('source') == 'docx' and isinstance(g.get('img_bytes'), (bytes, bytearray)):
+            g['img_bytes'] = base64.b64encode(g['img_bytes']).decode()
+            g['_img_b64'] = True
+        out.append(g)
+    _scan_path(project).write_text(json.dumps({'page_count': page_count, 'figures': out}, indent=1))
+def fe_load_scan(project, page_count):
+    p = _scan_path(project)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return None
+    if data.get('page_count') != page_count:
+        return None
+    figs = data.get('figures', [])
+    for g in figs:
+        if g.get('_img_b64'):
+            g['img_bytes'] = base64.b64decode(g['img_bytes']); g.pop('_img_b64', None)
+        g['page_img'] = None; g['img_boxes'] = []
+    return figs
+def fe_load_crops(project):
+    p = _crop_path(project)
+    if p.exists():
+        try: return json.loads(p.read_text())
+        except Exception: return {}
+    return {}
+def fe_save_crops(project, figs):
+    _CROPDIR.mkdir(exist_ok=True)
+    data = {}
+    for f in figs:
+        if f.get('manual_box'):
+            data[f['label']] = {k: f.get(k, 0) for k in
+                                ('crop_left','crop_top','crop_right','crop_bot')}
+            data[f['label']]['manual_box'] = True
+    _crop_path(project).write_text(json.dumps(data, indent=1))
+    return len(data)
+def fe_apply_saved(figs, saved):
+    n = 0
+    for f in figs:
+        s = saved.get(f['label'])
+        if s:
+            f.update(s); n += 1
+    return n
+
+# ── session state ─────────────────────────────────────────────────────────────
+for k,v in [('fe_figures',[]),('fe_pdf_bytes',None),('fe_src_name',''),
+             ('fe_src_type',''),('fe_captions',{}),('fe_scanned',False),
+             ('fe_project','')]:
+    if k not in st.session_state: st.session_state[k] = v
+
+# ── Step 1: Upload ────────────────────────────────────────────────────────────
+st.markdown("### Step 1 — Upload source file")
+uploaded = st.file_uploader("PDF or Word document", type=["pdf","docx"], key="fe_upload")
+c1, c2 = st.columns(2)
+with c1:
+    quality  = st.selectbox("Scan quality",
+                             ["Fast (150 DPI)","Standard (200 DPI)","High (300 DPI)"], index=1)
+with c2:
+    st.caption("Output: Times New Roman 10pt, 300 DPI, 0.75\" margins")
+scan_dpi = {"Fast (150 DPI)":150,"Standard (200 DPI)":200,"High (300 DPI)":300}[quality]
+
+if uploaded:
+    src_bytes = uploaded.read()
+    src_ext   = Path(uploaded.name).suffix.lower()
+    if src_bytes != st.session_state.fe_pdf_bytes:
+        st.session_state.fe_pdf_bytes = src_bytes
+        st.session_state.fe_src_name  = uploaded.name
+        st.session_state.fe_src_type  = src_ext
+        st.session_state.fe_figures   = []
+        st.session_state.fe_captions  = {}
+        st.session_state.fe_scanned   = False
+
+    # ── Page / chapter filter ──────────────────────────────────────────────
+    if src_ext == '.pdf':
+        _doc = fitz.open(stream=src_bytes, filetype="pdf")
+        _total_pages = _doc.page_count
+        _doc.close()
+        st.session_state.fe_total_pages = _total_pages
+        st.caption(f"{uploaded.name} — {_total_pages} pages")
+
+        st.markdown("**Limit scan to specific pages or a chapter** *(optional)*")
+        _fc1, _fc2 = st.columns(2)
+        with _fc1:
+            _page_range = st.text_input(
+                "Page range",
+                placeholder="e.g. 45-92 or 45,46,47",
+                help="Enter a range (45-92) or comma-separated page numbers. Leave blank to scan all pages.",
+                key="fe_page_range"
+            )
+        with _fc2:
+            _chapter_kw = st.text_input(
+                "Chapter keyword filter",
+                placeholder="e.g. Arthrogryposis",
+                help="Only extract figures whose caption contains this word. Leave blank for all figures.",
+                key="fe_chapter_kw"
+            )
+
+        # Parse page range into a set of 0-indexed page numbers
+        _page_filter = None
+        if _page_range.strip():
+            _page_filter = set()
+            for _part in _page_range.replace(' ','').split(','):
+                if '-' in _part:
+                    _a, _b = _part.split('-', 1)
+                    try:
+                        _page_filter.update(range(int(_a)-1, int(_b)))
+                    except ValueError:
+                        st.warning(f"Invalid range: {_part}")
+                elif _part.isdigit():
+                    _page_filter.add(int(_part)-1)
+            if _page_filter:
+                _valid = {p for p in _page_filter if 0 <= p < _total_pages}
+                st.caption(f"Will scan {len(_valid)} of {_total_pages} pages "
+                           f"(pages {min(_valid)+1}–{max(_valid)+1})")
+                _page_filter = _valid
+    else:
+        st.caption(f"{uploaded.name} — Word document")
+        _page_filter = None
+        _chapter_kw  = st.text_input(
+            "Chapter keyword filter",
+            placeholder="e.g. Arthrogryposis",
+            help="Only extract figures whose caption contains this word.",
+            key="fe_chapter_kw"
+        )
+
+    _proj_guess = st.session_state.fe_project or Path(st.session_state.fe_src_name).stem
+    _cached = fe_load_scan(_proj_guess, st.session_state.get("fe_total_pages", 0)) if src_ext == ".pdf" else None
+    if _cached is not None and not st.session_state.fe_scanned:
+        st.session_state.fe_project = _proj_guess
+        _sv = fe_load_crops(_proj_guess); fe_apply_saved(_cached, _sv)
+        st.session_state.fe_figures = _cached
+        st.session_state.fe_scanned = True
+        st.session_state.fe_captions = fe_load_captions(_proj_guess) or {}
+        st.success(f"Loaded saved scan ({len(_cached)} figure(s)) for \"{_proj_guess}\" — no re-scan needed.")
+    _force = st.button("↻ Re-scan (ignore cache)", key="fe_rescan") if _cached is not None else False
+    if st.button("Scan for figures", type="primary", key="fe_scan"):
+        with st.spinner("Scanning…"):
+            if src_ext == '.pdf':
+                figs = pdf_scan(src_bytes, dpi=scan_dpi, page_filter=_page_filter)
+            else:
+                figs = docx_scan(src_bytes)
+        # Apply chapter keyword filter
+        _kw = st.session_state.get("fe_chapter_kw","").strip().lower()
+        if _kw:
+            figs = [f for f in figs if _kw in f["caption"].lower() or _kw in f["label"].lower()]
+            st.info(f'Keyword filter "{_kw}" applied — {len(figs)} matching figure(s)')
+        st.session_state.fe_figures = figs
+        st.session_state.fe_scanned = True
+        if not st.session_state.fe_project:
+            st.session_state.fe_project = Path(st.session_state.fe_src_name).stem
+        try:
+            _tp = st.session_state.get('fe_total_pages', 0)
+            fe_save_scan(st.session_state.fe_project, _tp, figs)
+        except Exception as _e:
+            st.warning(f'Could not cache scan: {_e}')
+        if not st.session_state.fe_project:
+            st.session_state.fe_project = Path(st.session_state.fe_src_name).stem
+        _saved = fe_load_crops(st.session_state.fe_project)
+        _n = fe_apply_saved(figs, _saved)
+        st.session_state.fe_captions = fe_load_captions(st.session_state.fe_project) or {}
+        if _n: st.info(f'Restored {_n} saved crop(s) for project "{st.session_state.fe_project}".')
+        st.session_state.fe_captions = {}
+        if not figs:
+            st.warning("No figures found. Check that captions start with Figure / Table / Box / Plate + number.")
+        else:
+            st.success(f"Found {len(figs)} figure(s). Review below.")
+
+# ── Step 2: Review ────────────────────────────────────────────────────────────
+if st.session_state.fe_scanned and st.session_state.fe_figures:
+    _pc1, _pc2, _pc3, _pc4 = st.columns([3,1,1,2])
+    with _pc1:
+        _recent = fe_recent_projects()
+        if _recent:
+            _pick = st.selectbox("Recent projects", ["— current —"] + _recent, index=0, key="fe_recent_pick")
+            if _pick != "— current —" and _pick != st.session_state.fe_project:
+                st.session_state.fe_project = _pick
+                _sv = fe_load_crops(_pick); fe_apply_saved(st.session_state.fe_figures, _sv)
+                st.session_state.fe_captions = fe_load_captions(_pick) or {}
+                for _i2 in range(len(st.session_state.fe_figures)):
+                    st.session_state.pop(f"fe_pts_{_i2}", None)
+                st.rerun()
+        _proj = st.text_input("Project name (crops save under this)", value=st.session_state.fe_project, key="fe_proj_in")
+        if _proj != st.session_state.fe_project:
+            st.session_state.fe_project = _proj; st.rerun()
+    with _pc2:
+        if st.button("Save all", key="fe_saveall"):
+            _c = fe_save_crops(st.session_state.fe_project, st.session_state.fe_figures)
+            fe_save_captions(st.session_state.fe_project, st.session_state.fe_captions)
+            st.success(f"Saved {_c} crop(s) + captions.")
+    with _pc3:
+        if st.button("Restore", key="fe_restore"):
+            _sv = fe_load_crops(st.session_state.fe_project)
+            _c = fe_apply_saved(st.session_state.fe_figures, _sv)
+            for _i2 in range(len(st.session_state.fe_figures)):
+                st.session_state.pop(f"fe_pts_{_i2}", None)
+            st.success(f"Restored {_c} crop(s)."); st.rerun()
+    with _pc4:
+        _sc = sum(1 for _f in st.session_state.fe_figures if _f.get("manual_box"))
+        st.caption(f"{_sc} of {len(st.session_state.fe_figures)} cropped")
+    figs = st.session_state.fe_figures
+    _order = st.radio('List order',
+                      ['Order of appearance', 'Same-page top-to-bottom', 'By group'],
+                      horizontal=True, key='fe_order')
+    def _numkey(f):
+        m = re.match(r'\s*(\d+)[.\-](\d+)\s*([A-Za-z]?)', str(f.get('fig_num','')))
+        return (int(m.group(1)), int(m.group(2)), m.group(3).upper()) if m else (9999, 9999, '')
+    _grouprank = {'figure':0,'fig':0,'table':1,'box':2,'plate':3,'video':4}
+    _view = list(enumerate(figs))
+    if _order == 'Same-page top-to-bottom':
+        _view.sort(key=lambda t: (t[1].get('page_num',0), (t[1].get('caption_y') or 0)))
+    elif _order == 'By group':
+        _view.sort(key=lambda t: (_grouprank.get(str(t[1].get('fig_type','')).lower(), 9),
+                                  t[1].get('page_num',0), _numkey(t[1])))
+    st.divider()
+    st.markdown(f"### Step 2 — Review {len(figs)} figure(s)")
+
+    type_counts = {}
+    for f in figs: type_counts[f['fig_type']] = type_counts.get(f['fig_type'],0)+1
+    cols = st.columns(min(len(type_counts),6))
+    for i,(t,c) in enumerate(sorted(type_counts.items())): cols[i].metric(t+"s",c)
+
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        if st.button("Select all", key="fe_selall"):
+            for f in figs: f['include']=True; st.rerun()
+    with bc2:
+        if st.button("Deselect all", key="fe_desel"):
+            for f in figs: f['include']=False; st.rerun()
+
+    for i, fig in _view:
+        included = fig.get('include',True)
+        chk_col, content_col = st.columns([1,11])
+        with chk_col:
+            inc = st.checkbox("include", value=included, key=f"fe_inc_{i}", label_visibility="collapsed")
+            if inc != included: figs[i]['include']=inc; st.rerun()
+        with content_col:
+            st.markdown(f"**{fig['label']}** — "
+                        f"{'Page '+str(fig['page_num']+1) if fig['source']=='pdf' else 'Word doc'}")
+            with st.expander("Preview & adjust"):
+                st.caption("Click top-left then bottom-right to crop. Box = exactly what exports.")
+                if fig['source'] == 'pdf':
+                    _disp = pdf_render(st.session_state.fe_pdf_bytes, fig['page_num'], dpi=SCAN_DPI)
+                else:
+                    _disp = Image.open(io.BytesIO(fig['img_bytes'])).convert('RGB')
+                _disp = _disp.copy()
+                _disp.thumbnail((700, 900))
+                _dw, _dh = _disp.size
+                _ck = f"fe_pts_{i}"
+                if _ck not in st.session_state: st.session_state[_ck] = []
+                _pts = st.session_state[_ck]
+                _msg = '1 corner set — now click bottom-right' if len(_pts)==1 else ('box set ✔' if len(_pts)>=2 else 'click top-left corner')
+                _hc1, _hc2 = st.columns([5,1])
+                _hc1.caption('Click two corners: top-left, then bottom-right. ' + _msg)
+                if _hc2.button('Reset', key=f'fe_rst_{i}'):
+                    st.session_state[_ck] = []; figs[i]['manual_box']=False; st.rerun()
+                _coord = streamlit_image_coordinates(_disp, key=f'fe_img_{i}')
+                if _coord is not None:
+                    _p = (_coord['x'], _coord['y'])
+                    if not _pts or _pts[-1] != _p:
+                        _pts.append(_p); st.session_state[_ck] = _pts[-2:]; st.rerun()
+                if len(_pts) >= 2:
+                    (x1,y1),(x2,y2) = _pts[0], _pts[1]
+                    _L,_R = sorted([x1,x2]); _T,_B = sorted([y1,y2])
+                    figs[i]['crop_left']  = max(0, _L) / _dw * 100
+                    figs[i]['crop_top']   = max(0, _T) / _dh * 100
+                    figs[i]['crop_right'] = max(0, _dw - _R) / _dw * 100
+                    figs[i]['crop_bot']   = max(0, _dh - _B) / _dh * 100
+                    figs[i]['manual_box'] = True
+                    _pl = int(_dw * figs[i]['crop_left']/100)
+                    _pt = int(_dh * figs[i]['crop_top']/100)
+                    _pr = _dw - int(_dw * figs[i]['crop_right']/100)
+                    _pb = _dh - int(_dh * figs[i]['crop_bot']/100)
+                    _prev = _disp.crop((max(0,_pl), max(0,_pt), min(_dw,max(_pl+10,_pr)), min(_dh,max(_pt+10,_pb))))
+                    st.caption('Crop preview (what will export):')
+                    st.image(_prev)
+                    try: fe_save_crops(st.session_state.fe_project, figs)
+                    except Exception: pass
+
+            current = st.session_state.fe_captions.get(fig['label'], fig['caption'])
+            st.markdown("**Caption** *(fix OCR errors only — do not paraphrase)*")
+            edited = st.text_area("", value=current, height=85,
+                                  key=f"fe_cap_{i}", label_visibility="collapsed")
+            if edited != current:
+                st.session_state.fe_captions[fig['label']] = edited
+                try: fe_save_captions(st.session_state.fe_project, st.session_state.fe_captions)
+                except Exception: pass
+
+    # ── Step 3: Generate ──────────────────────────────────────────────────────
+    included_n = sum(1 for f in figs if f.get('include',True))
+    st.divider()
+    st.markdown(f"### Step 3 — Generate outputs ({included_n} selected)")
+
+    if included_n == 0:
+        st.warning("No figures selected.")
+    else:
+        if st.button(f"Generate PDF + Word ({included_n} figures)", type="primary", key="fe_gen"):
+            pdf_for_crop = st.session_state.fe_pdf_bytes if st.session_state.fe_src_type=='.pdf' else None
+            with st.spinner("Cropping and building documents…"):
+                try:
+                    caps = {k: _xml_safe(v) for k, v in st.session_state.fe_captions.items()}
+                    pdf_out  = build_pdf(figs, caps, pdf_bytes=pdf_for_crop)
+                    word_out = build_word(figs, caps, pdf_bytes=pdf_for_crop)
+                    stem = Path(st.session_state.fe_src_name).stem
+                    st.success(f"Done — {included_n} figures.")
+                    dl1, dl2 = st.columns(2)
+                    with dl1:
+                        st.download_button("Download PDF", data=pdf_out,
+                            file_name=f"{stem}_figures.pdf", mime="application/pdf",
+                            type="primary", use_container_width=True)
+                    with dl2:
+                        st.download_button("Download Word (.docx)", data=word_out,
+                            file_name=f"{stem}_figures.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            type="primary", use_container_width=True)
+                except Exception as e:
+                    st.error(f"Generation failed: {e}"); st.exception(e)
+
+        with st.expander("Download individual figures as PNG"):
+            pdf_for_crop = st.session_state.fe_pdf_bytes if st.session_state.fe_src_type=='.pdf' else None
+            for i, fig in enumerate(figs):
+                if not fig.get('include',True): continue
+                c1, c2 = st.columns([4,1])
+                with c1: st.markdown(f"**{fig['label']}**")
+                with c2:
+                    try:
+                        png = img_to_bytes(get_cropped(fig, pdf_bytes=pdf_for_crop))
+                        st.download_button("PNG", data=png,
+                            file_name=f"{fig['label'].replace(' ','_')}.png",
+                            mime="image/png", key=f"fe_png_{i}")
+                    except Exception as e:
+                        st.caption(f"Error: {e}")
