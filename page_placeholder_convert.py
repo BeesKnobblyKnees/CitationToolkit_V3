@@ -53,6 +53,7 @@ with c2:
 bib_up = None
 bib_from_doc = True
 ref_styles = ('refmark',)
+sectioned_mode = False
 if do_ref:
     picks = st.multiselect(
         "Which numbered markers should I detect?",
@@ -85,6 +86,14 @@ if do_ref:
         bib_up = st.file_uploader("Numbered reference list (.docx)", type=["docx"], key="pe_bib")
     st.caption("The numbers are reference-list **positions** - pin the exact list those numbers "
                "were generated against (the numbered bibliography at the bottom of the chapter).")
+    st.markdown("**Numbering style**")
+    sectioned_mode = st.checkbox(
+        "Sectioned reference list — numbering restarts in each section "
+        "(published chapters: Pelvis 1…, Hip 1…, Femur 1…)",
+        key="pe_sectioned")
+    st.caption("Turn this on when the same number (e.g. 38) appears in several sections. "
+               "Each in-text number is then resolved against the reference list of the "
+               "**section it sits in**, matched by the body's section headings.")
 
 # ── options ────────────────────────────────────────────────────────────────
 typed_detect = "highlight"
@@ -129,7 +138,7 @@ if go:
                     doc_up.read(), lib_up.read(),
                     do_green=do_green, do_refmarkers=do_ref,
                     highlight=HL[hl_label], apply_near=apply_near,
-                    typed_detect=typed_detect, ref_styles=ref_styles,
+                    typed_detect=typed_detect, ref_styles=ref_styles, sectioned=sectioned_mode,
                     bib_source_bytes=(bib_up.read() if (do_ref and not bib_from_doc and bib_up) else None),
                 )
                 report_docx = pc.build_report_docx(report)

@@ -28,9 +28,13 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 try:
-    from citation_bibrelink_module import parse_bibliography
+    from citation_bibrelink_module import (parse_bibliography,
+                                            parse_bibliography_sectioned, _norm_section)
 except Exception:
     parse_bibliography = None
+    parse_bibliography_sectioned = None
+    def _norm_section(t):
+        return re.sub(r'[^a-z]', '', (t or '').lower())
 
 ORANGE = "FFC000"   # suggested
 RED = "FF5B5B"      # unresolved
@@ -389,11 +393,12 @@ class _Report(list):
     """Placeholder rows, plus .bib_snapshot ({num -> reference text}) so the
     report can print the bibliography it resolved against for later reference."""
     bib_snapshot = None
+    bib_snapshot_sectioned = None
 
 
 def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
             highlight='GREEN', apply_near=False, bib_source_bytes=None,
-            typed_detect='highlight', ref_styles=('refmark',)):
+            typed_detect='highlight', ref_styles=('refmark',), sectioned=False):
     """typed_detect in {'highlight','pattern','both'} controls how typed
     citations are found (only relevant when do_green=True).
     ref_styles selects which numbered markers to detect: any of
@@ -401,12 +406,48 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
     lib = load_library(enlx_bytes)
     bib, bibtext = {}, {}
     bibfull = {}
+    sec_bib, sec_text, sec_full, sec_names = {}, {}, {}, {}
     if do_refmarkers and parse_bibliography is not None:
         try:
             bib, bibtext = parse_bibliography(bib_source_bytes or docx_bytes)
             bibfull = _parse_bib_full(bib_source_bytes or docx_bytes)
         except Exception:
             bib, bibtext, bibfull = {}, {}, {}
+    if do_refmarkers and sectioned and parse_bibliography_sectioned is not None:
+        try:
+            sec_bib, sec_text, sec_full, sec_names = parse_bibliography_sectioned(bib_source_bytes or docx_bytes)
+        except Exception:
+            sec_bib, sec_text, sec_full, sec_names = {}, {}, {}, {}
+
+    # section-aware lookups: when a sectioned bibliography is in play, resolve a
+    # number against the section of the body the citation sits in (numbering
+    # restarts per section), else fall back to the flat number->reference map.
+    cur_sec = [None]
+    def _update_sec(para):
+        if sec_bib:
+            hk = _norm_section(para.text or '')
+            if hk in sec_bib:
+                cur_sec[0] = hk
+    def _bib_get(num):
+        if sec_bib and cur_sec[0] in sec_bib:
+            return sec_bib[cur_sec[0]].get(num)
+        return bib.get(num)
+    def _hint_get(num):
+        if sec_bib and cur_sec[0] in sec_bib:
+            return (sec_full.get(cur_sec[0], {}).get(num)
+                    or sec_text.get(cur_sec[0], {}).get(num, ''))
+        return bibfull.get(num) or bibtext.get(num, '')
+    def _sec_has(num):
+        if sec_bib and cur_sec[0] in sec_bib:
+            return num in sec_text.get(cur_sec[0], {}) or num in sec_bib[cur_sec[0]]
+        return num in bibtext
+    def _sec_maxnum():
+        if sec_bib and cur_sec[0] in sec_bib:
+            keys = set(sec_bib.get(cur_sec[0], {})) | set(sec_text.get(cur_sec[0], {}))
+            return max(keys) if keys else 0
+        return max(set(bib) | set(bibtext)) if (bib or bibtext) else 0
+    def _has_bib():
+        return bool(bib or sec_bib)
 
     doc = Document(io.BytesIO(docx_bytes))
     _target_paras = _iter_body_and_table_paras(doc)
@@ -441,6 +482,11 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
     # so the report stays interpretable if the bibliography is later renumbered
     report.bib_snapshot = (dict(bibfull) or dict(bibtext)
                            or {n: ("%s, %s" % v) for n, v in bib.items()})
+    if sec_bib:
+        src = sec_full or sec_text
+        report.bib_snapshot_sectioned = [
+            (sec_names.get(k, k) or "(unsectioned)", dict(src.get(k, {})))
+            for k in src if src.get(k)]
     use_hl = do_green and typed_detect in ('highlight', 'both')
     use_pat = do_green and typed_detect in ('pattern', 'both')
 
@@ -554,7 +600,9 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
     # ---- pass 3: numbered markers  [[REF n]] / [n] / (n) ----
     if do_refmarkers and ref_styles:
         pats = [(s, _NUM_PAT[s]) for s in ref_styles if s in _NUM_PAT]
+        cur_sec[0] = None
         for para in _target_paras:
+            _update_sec(para)
             full = ''.join(r.text or '' for r in _effective_runs(para))
             if not full:
                 continue
@@ -574,13 +622,13 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 nums = _expand_nums(inner)
                 if not nums:
                     continue
-                in_bib = any(bib.get(num) is not None for num in nums)
+                in_bib = any(_bib_get(num) is not None for num in nums)
                 if style != 'refmark' and not in_bib:
                     continue  # bracketed/parenthesised number that isn't a reference
                 resolved, suggested, missing, ambig = [], [], [], []
                 bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
                 for num in nums:
-                    sy = bib.get(num); hint = bibfull.get(num) or bibtext.get(num, '')
+                    sy = _bib_get(num); hint = _hint_get(num)
                     if not sy:
                         missing.append((num, None)); continue
                     st, item, kind = classify(num, sy[0], sy[1], hint)
@@ -603,7 +651,9 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
 
     # ---- pass 4: superscript numbered citations  (Vancouver / JAMA ^1,2) ----
     if do_refmarkers and 'superscript' in (ref_styles or ()):
+        cur_sec[0] = None
         for para in _target_paras:
+            _update_sec(para)
             runs = _effective_runs(para)
             n = len(runs)
             i = 0
@@ -622,24 +672,20 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 group_text = ''.join(runs[k].text or '' for k in members)
                 nums = _expand_nums(group_text.replace(';', ','))
                 prev_text = runs[members[0] - 1].text if members[0] > 0 else ''
-                if not nums or _looks_like_exponent(prev_text) or not bib:
+                if not nums or _looks_like_exponent(prev_text) or not _has_bib():
                     i = j; continue
-                maxnum = max(set(bib) | set(bibtext)) if (bib or bibtext) else 0
+                maxnum = _sec_maxnum()
                 resolved, suggested, missing, ambig, dangling = [], [], [], [], []
                 bucket = {'resolved': resolved, 'suggested': suggested, 'missing': missing}
                 for num in nums:
-                    sy = bib.get(num)
+                    sy = _bib_get(num)
                     if not sy:
-                        if num in bibtext:
-                            # the reference exists in the list but its surname/year
-                            # couldn't be parsed -> unresolved (can't match), NOT dangling.
+                        if _sec_has(num):
                             missing.append((num, None))
                         elif num <= maxnum:
-                            # a real gap inside the numbered range = dangling citation
-                            # (reference deleted, or the in-text number is wrong).
                             dangling.append(num)
                         continue
-                    hint = bibfull.get(num) or bibtext.get(num, '')
+                    hint = _hint_get(num)
                     st, item, kind = classify(num, sy[0], sy[1], hint)
                     bucket[st].append(item)
                     if kind == 'ambiguous':
@@ -814,6 +860,13 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
     h = doc.add_paragraph(); r = h.add_run(title)
     r.bold = True; r.font.size = Pt(16); r.font.color.rgb = RGBColor.from_string(ACCENT)
     sm = summarize(report)
+    # new continuous citation numbers: each distinct record numbered by first appearance
+    # (matches how Vancouver / citation-order styles renumber on Update)
+    newnum = {}
+    for row in report:
+        for key, rec in (row['resolved'] + row['suggested']):
+            if rec['id'] not in newnum:
+                newnum[rec['id']] = len(newnum) + 1
     sp = doc.add_paragraph(); _danglingtot = sm.get('dangling_refs', 0)
     _summ = ("%d placeholder(s):  %d reference(s) applied  (%d of them flagged to verify),  %d unresolved (red)."
              % (sm['placeholders'], sm['applied_refs'], sm['verify_refs'], sm['unresolved_refs']))
@@ -822,9 +875,11 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
     sr = sp.add_run(_summ)
     sr.font.size = Pt(9); sr.bold = True
     note = doc.add_paragraph(); nr = note.add_run(
-        "Everything with a library match was applied as {Author, Year #RecNum}. VERIFY rows were "
-        "applied too but are the matcher's best guess - check the ones marked \u201csame author/year\u201d "
-        "first, those are the likeliest to need a swap. Unresolved (red) = in your list but not in the "
+        "Everything with a library match was applied as {Author, Year #RecNum}. \u201cnew #\u201d is the "
+        "continuous citation number the reference will take once EndNote renumbers on Update "
+        "(first-appearance / citation order) - so a section-scoped in-text number like Pelvis 38 "
+        "becomes its new #. VERIFY rows were applied too but are the matcher's best guess - check "
+        "the ones marked \u201csame author/year\u201d first. Unresolved (red) = in your list but not in the "
         "library, add it. DANGLING (red) = the in-text number has no matching entry in the reference "
         "list at all - the reference was likely deleted or the numbering is off; fix the list or remove "
         "the citation.")
@@ -851,12 +906,12 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
             if fill:
                 _shade_run(rr, fill)
         for key, rec in row['resolved']:
-            line("APPLIED   %s  \u2192  %s, %s #%d  (%s)" % (key, rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "1A6B2A")
+            line("APPLIED   %s  \u2192  new #%s   %s, %s #%d  (%s)" % (key, newnum.get(rec['id'], '?'), rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "1A6B2A")
         amb = set(row.get('ambiguous', []))
         for key, rec in row['suggested']:
             tag = "VERIFY (same author/year)" if key in amb else "VERIFY (near match)"
-            line("%s  %s  \u2192  %s, %s #%d  (%s)  \u2013 applied, double-check"
-                 % (tag, key, rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "7A5A00", fill=ORANGE)
+            line("%s  %s  \u2192  new #%s   %s, %s #%d  (%s)  \u2013 applied, double-check"
+                 % (tag, key, newnum.get(rec['id'], '?'), rec['sur'], rec['year'], rec['id'], rec['jour'][:24]), "7A5A00", fill=ORANGE)
         for key, rec in row['missing']:
             line("UNRESOLVED  %s  \u2013 add to library" % key, "8B1A1A", bold=True, fill=RED)
         for num in row.get('dangling', []):
@@ -872,8 +927,9 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
     # ── bibliography snapshot ─────────────────────────────────────────────── #
     # The reference list resolved against, kept at the end so the resolved/verify/
     # unresolved rows above stay interpretable if the bibliography is renumbered.
+    snap_sec = getattr(report, 'bib_snapshot_sectioned', None)
     snap = bib_snapshot or getattr(report, 'bib_snapshot', None)
-    if snap:
+    if snap_sec or snap:
         doc.add_paragraph()
         _hb = doc.add_paragraph().add_run("Bibliography used (snapshot)")
         _hb.bold = True; _hb.font.size = Pt(13); _hb.font.color.rgb = RGBColor.from_string(ACCENT)
@@ -881,21 +937,34 @@ def build_report_docx(report, title="Placeholder \u2192 EndNote Conversion Repor
             "The reference list these citations were resolved against, captured at conversion "
             "time. Keep it to re-check the numbers above if the bibliography is later renumbered.")
         _nb.font.size = Pt(8.5); _nb.italic = True; _nb.font.color.rgb = RGBColor.from_string("666666")
-        bt = doc.add_table(rows=1, cols=2); grid(bt)
-        for i, t in enumerate(["#", "Reference"]):
-            c = bt.rows[0].cells[i]; rn = c.paragraphs[0].add_run(t)
-            rn.bold = True; rn.font.size = Pt(10); rn.font.color.rgb = RGBColor.from_string("FFFFFF"); shade(c, ACCENT)
-        _bp = bt.rows[0]._tr.get_or_add_trPr(); _bh = OxmlElement('w:tblHeader')
-        _bh.set(qn('w:val'), 'true'); _bp.append(_bh)
-        for num in sorted(snap):
-            r2 = bt.add_row()
-            c0 = r2.cells[0]; rr0 = c0.paragraphs[0].add_run(str(num))
-            rr0.bold = True; rr0.font.size = Pt(9.5)
-            rr0.font.color.rgb = RGBColor.from_string(ACCENT); shade(c0, FILL)
-            rr1 = r2.cells[1].paragraphs[0].add_run(str(snap[num])); rr1.font.size = Pt(9)
-        bt.autofit = False; bt.allow_autofit = False
-        for rw in bt.rows:
-            rw.cells[0].width = Inches(0.5); rw.cells[1].width = Inches(6.5)
+
+        def _snap_table(entries):
+            bt = doc.add_table(rows=1, cols=2); grid(bt)
+            for i, t in enumerate(["#", "Reference"]):
+                c = bt.rows[0].cells[i]; rn = c.paragraphs[0].add_run(t)
+                rn.bold = True; rn.font.size = Pt(10); rn.font.color.rgb = RGBColor.from_string("FFFFFF"); shade(c, ACCENT)
+            _bp = bt.rows[0]._tr.get_or_add_trPr(); _bh = OxmlElement('w:tblHeader')
+            _bh.set(qn('w:val'), 'true'); _bp.append(_bh)
+            for num in sorted(entries):
+                r2 = bt.add_row()
+                c0 = r2.cells[0]; rr0 = c0.paragraphs[0].add_run(str(num))
+                rr0.bold = True; rr0.font.size = Pt(9.5)
+                rr0.font.color.rgb = RGBColor.from_string(ACCENT); shade(c0, FILL)
+                rr1 = r2.cells[1].paragraphs[0].add_run(str(entries[num])); rr1.font.size = Pt(9)
+            bt.autofit = False; bt.allow_autofit = False
+            for rw in bt.rows:
+                rw.cells[0].width = Inches(0.5); rw.cells[1].width = Inches(6.5)
+
+        if snap_sec:
+            for sec_name, entries in snap_sec:
+                if not entries:
+                    continue
+                _hs = doc.add_paragraph().add_run(sec_name)
+                _hs.bold = True; _hs.font.size = Pt(11); _hs.font.color.rgb = RGBColor.from_string(ACCENT)
+                _snap_table(entries)
+                doc.add_paragraph()
+        else:
+            _snap_table(snap)
 
     buf = io.BytesIO(); doc.save(buf)
     return _fix_zoom(buf.getvalue())

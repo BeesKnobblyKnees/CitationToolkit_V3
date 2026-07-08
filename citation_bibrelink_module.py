@@ -519,3 +519,51 @@ def build_placeholders_docx(placeholders, title="Citation Placeholders to Insert
                 d = re.sub(rb'<w:zoom[^>]*/>', b'<w:zoom w:percent="100"/>', d)
             zout.writestr(it, d)
     return out.getvalue()
+
+
+# ── sectioned bibliography support ──────────────────────────────────────────
+# Published chapters often restart citation numbering in each anatomic section
+# (Pelvis 1..N, Hip 1..N, ...). A flat {num: ref} map collides; key by section.
+def _norm_section(t):
+    return re.sub(r'[^a-z]', '', (t or '').lower())
+
+_SEC_AM = re.compile(
+    r'^((?:(?:van|von|der|den|de|del|della|da|di|du|dos|das|la|le|el|'
+    r'ten|ter|af|zu|zur|zum|of)\s+)*'
+    r'[A-Z\u00C0-\u017F][A-Za-z\u00C0-\u017F\'\-]*)')
+
+def parse_bibliography_sectioned(draft_bytes):
+    """Sectioned bibliography whose numbering restarts per section.
+    Returns (sec_bib, sec_text, sec_full):
+        sec_bib  : {section_key: {num: (surname, year)}}
+        sec_text : {section_key: {num: display text}}
+        sec_full : {section_key: {num: full reference text}}
+    section_key is _norm_section() of the heading, so body 'Hip Dislocations'
+    and bib 'Hip: Dislocations' collapse to the same key. Accepts 'N.' and 'N '
+    numbering and lettered entries are skipped (handled by the flat parser)."""
+    d = docx.Document(io.BytesIO(draft_bytes))
+    sec_bib, sec_text, sec_full, sec_names = {}, {}, {}, {}
+    section = None
+    started = False
+    for p in d.paragraphs:
+        t = (p.text or '').strip()
+        if not t:
+            continue
+        if not started:
+            if t.lower() == 'references':
+                started = True
+            continue
+        m = re.match(r'^(\d{1,3})[.\s]\s*(.{15,})$', t)
+        if m:
+            num, rest = int(m.group(1)), m.group(2)
+            key = section or ''
+            sec_text.setdefault(key, {})[num] = _format_ref(rest)
+            sec_full.setdefault(key, {})[num] = rest
+            yr = re.findall(r'\b(18|19|20)(\d{2})\b', rest)
+            am = _SEC_AM.match(rest)
+            if yr and am:
+                sec_bib.setdefault(key, {})[num] = (am.group(1).lower(), yr[-1][0] + yr[-1][1])
+        elif p.style.name.startswith('Heading') or (len(t) < 45 and not re.search(r'\d{4}', t)):
+            section = _norm_section(t)
+            sec_names[section] = t
+    return sec_bib, sec_text, sec_full, sec_names
