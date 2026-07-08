@@ -29,10 +29,12 @@ from docx.oxml import OxmlElement
 
 try:
     from citation_bibrelink_module import (parse_bibliography,
-                                            parse_bibliography_sectioned, _norm_section)
+                                            parse_bibliography_sectioned, _norm_section,
+                                            missing_refs_files)
 except Exception:
     parse_bibliography = None
     parse_bibliography_sectioned = None
+    missing_refs_files = None
     def _norm_section(t):
         return re.sub(r'[^a-z]', '', (t or '').lower())
 
@@ -43,11 +45,21 @@ _CITE_RE = re.compile(r'\(([^()]*\b(?:18|19|20)\d{2}\b[^()]*)\)')
 
 # ── library ────────────────────────────────────────────────────────────────
 def load_library(enlx_bytes):
-    zf = zipfile.ZipFile(io.BytesIO(enlx_bytes))
-    eni = next((n for n in zf.namelist() if n.endswith('sdb.eni')), None)
-    if not eni:
-        raise ValueError("No sdb.eni database found inside the .enlx file.")
-    raw = zf.read(eni)
+    # Accept either a compressed .enlx (zip of the sdb/ folder) OR a raw sdb.eni
+    # SQLite database (grab it from YourLibrary.Data/sdb/sdb.eni to skip compressing).
+    if enlx_bytes[:2] == b'PK':
+        zf = zipfile.ZipFile(io.BytesIO(enlx_bytes))
+        eni = next((n for n in zf.namelist() if n.endswith('sdb.eni')), None)
+        if not eni:
+            raise ValueError("No sdb.eni database found inside the .enlx file.")
+        raw = zf.read(eni)
+    elif enlx_bytes[:15] == b'SQLite format 3':
+        raw = enlx_bytes                       # raw sdb.eni (or a SQLite .enl) uploaded directly
+    else:
+        raise ValueError(
+            "That file has no reference data the app can read. Upload the compressed "
+            "library (.enlx), or the database itself: YourLibrary.Data\\sdb\\sdb.eni  "
+            "(the plain .enl file is only an index and doesn't contain the references).")
     import tempfile
     tmp = tempfile.NamedTemporaryFile(suffix='.eni', delete=False)
     tmp.write(raw); tmp.close()
@@ -497,7 +509,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
         rec, score, kind = match_to_library(surname, year, hint, lib)
         if rec and kind in ('exact', 'near', 'ambiguous'):
             return ('resolved' if kind == 'exact' else 'suggested'), (key, rec), kind
-        return 'missing', (key, None), 'none'
+        return 'missing', (key, hint), 'none'
 
     def split_refs(text):
         resolved, suggested, missing, ambig = [], [], [], []
@@ -630,7 +642,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                 for num in nums:
                     sy = _bib_get(num); hint = _hint_get(num)
                     if not sy:
-                        missing.append((num, None)); continue
+                        missing.append((num, _hint_get(num))); continue
                     st, item, kind = classify(num, sy[0], sy[1], hint)
                     bucket[st].append(item)
                     if kind == 'ambiguous':
@@ -681,7 +693,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                     sy = _bib_get(num)
                     if not sy:
                         if _sec_has(num):
-                            missing.append((num, None))
+                            missing.append((num, _hint_get(num)))
                         elif num <= maxnum:
                             dangling.append(num)
                         continue
@@ -764,7 +776,7 @@ def convert(docx_bytes, enlx_bytes, do_green=True, do_refmarkers=True,
                     sy = bib.get(num)
                     if not sy:
                         if num in bibtext:
-                            missing.append((num, None))
+                            missing.append((num, _hint_get(num)))
                         elif num <= maxnum:
                             dangling.append(num)
                         continue
@@ -823,6 +835,26 @@ def _fix_zoom(b, extra_parts=None):
 
 
 # ── summary + report doc ─────────────────────────────────────────────────── #
+def missing_references(report):
+    """Unique unresolved reference texts from a conversion report, as (label, text)."""
+    seen = set(); out = []
+    for row in report:
+        for num, text in row.get('missing', []):
+            if text and text not in seen:
+                seen.add(text); out.append(("[unresolved #%s]" % num, text))
+    return out
+
+
+def build_missing_imports(report):
+    """-> dict with 'ris' / 'enw' / 'docx' bytes for the unresolved references
+    (import into EndNote, or upload the .docx to Find-Missing-References), or
+    None if there are none or the exporter isn't available."""
+    refs = missing_references(report)
+    if not refs or missing_refs_files is None:
+        return None
+    return missing_refs_files(refs)
+
+
 def summarize(report):
     applied = sum(len(r['resolved']) + len(r['suggested']) for r in report)
     verify = sum(len(r['suggested']) for r in report)

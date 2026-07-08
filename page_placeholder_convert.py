@@ -47,7 +47,7 @@ c1, c2 = st.columns(2)
 with c1:
     doc_up = st.file_uploader("Document with placeholders (.docx)", type=["docx"], key="pe_doc")
 with c2:
-    lib_up = st.file_uploader("EndNote library (.enlx)", type=["enlx"], key="pe_lib")
+    lib_up = st.file_uploader("EndNote library — upload the .enlx, or YourLibrary.Data/sdb/sdb.eni", type=["enlx", "eni", "enl"], key="pe_lib")
 
 # ── numbered-marker styles + reference-list source ─────────────────────────
 bib_up = None
@@ -143,15 +143,17 @@ if go:
                 )
                 report_docx = pc.build_report_docx(report)
                 stem = os.path.splitext(doc_up.name)[0]
+                missing_files = pc.build_missing_imports(report)
                 st.session_state["pe_out"] = (out, report_docx, pc.summarize(report),
                                               report, f"{stem}_EndNote_ready.docx",
-                                              f"{stem}_conversion_report.docx", do_ref)
+                                              f"{stem}_conversion_report.docx", do_ref,
+                                              missing_files, stem)
         except Exception as e:
             st.error(f"Could not convert: {e}")
 
 res = st.session_state.get("pe_out")
 if res:
-    out, report_docx, sm, report, out_name, rep_name, was_ref = res
+    out, report_docx, sm, report, out_name, rep_name, was_ref, missing_files, stem = res
     if was_ref and sm["placeholders"] and sm["resolved_refs"] == 0 and sm["unresolved_refs"]:
         st.warning("No numbered markers resolved - the chosen reference list may not match "
                    "these markers (or has no numbered entries). Check the source list.")
@@ -171,6 +173,27 @@ if res:
         st.download_button("\u2b07  Match report (.docx)", data=report_docx, file_name=rep_name,
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                            use_container_width=True, key="pe_dl2")
+
+    if missing_files:
+        st.markdown("**Missing references** (not in your library) \u2014 import into EndNote, or upload "
+                    "the .docx to the Find-Missing-References app (one clean reference per line, so it "
+                    "won't split them into fragments).")
+        e1, e2, e3 = st.columns(3)
+        with e1:
+            st.download_button("\u2b07  Missing refs (.ris)", data=missing_files["ris"],
+                               file_name=f"{stem}_missing_refs.ris",
+                               mime="application/x-research-info-systems",
+                               use_container_width=True, key="pe_ris")
+        with e2:
+            st.download_button("\u2b07  Missing refs (.enw)", data=missing_files["enw"],
+                               file_name=f"{stem}_missing_refs.enw",
+                               mime="application/x-endnote-library",
+                               use_container_width=True, key="pe_enw")
+        with e3:
+            st.download_button("\u2b07  For Ref-Finder (.docx)", data=missing_files["docx"],
+                               file_name=f"{stem}_missing_refs.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                               use_container_width=True, key="pe_mdocx")
 
     if sm["verify_refs"] or sm["unresolved_refs"] or sm.get("dangling_refs"):
         msg = ("All matched references were applied. **%d** are best-guess matches flagged to "

@@ -567,3 +567,109 @@ def parse_bibliography_sectioned(draft_bytes):
             section = _norm_section(t)
             sec_names[section] = t
     return sec_bib, sec_text, sec_full, sec_names
+
+
+# ── missing-reference export (shared by all apps) ───────────────────────────
+# Turn unresolved reference *text* (Vancouver style) into an EndNote-importable
+# .ris / .enw, or a clean one-reference-per-line .docx for the Find-Missing-
+# References app (single lines so it never splits a reference across fragments).
+def parse_vancouver_ref(text):
+    text = re.sub(r'[\u00ad]', '', text or '')
+    text = re.sub(r'-\s+', '-', text)                 # heal line-break hyphenation
+    text = re.sub(r'\s+', ' ', text).strip()
+    m = re.match(r'^((?:[A-Z\u00C0-\u017F][A-Za-z\u00C0-\u017F\'\-]+(?:\s+[A-Za-z\'\-]+)*'
+                 r'\s+[A-Z][A-Za-z]{0,3}(?:,\s+)?)+(?:et al\.?)?)\.\s+(.*)$', text)
+    if not m:
+        m = re.match(r'^(.*?[A-Z]{1,3})\.\s+([A-Z].*)$', text)
+    authors_raw = m.group(1) if m else ''
+    rest = m.group(2) if m else text
+    authors = []
+    for a in re.split(r',\s*', authors_raw):
+        a = a.strip().rstrip('.')
+        if not a or a.lower() in ('et al', 'et al.'):
+            continue
+        am = re.match(r'^(.*?)\s+([A-Z]{1,4})$', a)
+        if am:
+            authors.append("%s, %s" % (am.group(1).strip(), ' '.join(c + '.' for c in am.group(2))))
+        else:
+            authors.append(a)
+    ym = re.search(r'(\d{4})\s*;\s*(\d+[A-Za-z]?)?\s*(?:\(([^)]+)\))?\s*:\s*([A-Za-z]?\d+)'
+                   r'(?:\s*[-\u2013]\s*([A-Za-z]?\d+))?', rest)
+    year = vol = iss = sp = ep = ''
+    body = rest
+    if ym:
+        year, vol, iss, sp, ep = (ym.group(i) or '' for i in range(1, 6))
+        body = rest[:ym.start()].strip()
+    else:
+        ye = re.search(r'\b((?:19|20)\d{2})\b', rest)
+        if ye:
+            year = ye.group(1); body = rest[:ye.start()].strip()
+    body = body.rstrip('. ').strip()
+    parts = [p.strip() for p in re.split(r'\.\s+', body) if p.strip()]
+    journal = parts[-1] if len(parts) >= 2 else ''
+    title = '. '.join(parts[:-1]) if len(parts) >= 2 else body
+    return {'authors': authors, 'title': title, 'journal': journal,
+            'volume': vol, 'issue': iss, 'spage': sp, 'epage': ep, 'year': year}
+
+def refs_to_ris(refs):
+    """refs: list of (label, text) or plain text strings -> RIS string."""
+    out = []
+    for item in refs:
+        label, text = item if isinstance(item, (tuple, list)) else ('', item)
+        f = parse_vancouver_ref(text)
+        if not (f['authors'] or f['title']):
+            continue
+        r = ["TY  - JOUR"]
+        r += ["AU  - " + a for a in f['authors']]
+        if f['title']:   r.append("TI  - " + f['title'])
+        if f['journal']: r.append("JO  - " + f['journal'])
+        if f['volume']:  r.append("VL  - " + f['volume'])
+        if f['issue']:   r.append("IS  - " + f['issue'])
+        if f['spage']:   r.append("SP  - " + f['spage'])
+        if f['epage']:   r.append("EP  - " + f['epage'])
+        if f['year']:    r.append("PY  - " + f['year'])
+        if label:        r.append("N1  - " + str(label))
+        r.append("ER  - ")
+        out.append("\n".join(r))
+    return "\n".join(out) + "\n"
+
+def refs_to_enw(refs):
+    out = []
+    for item in refs:
+        label, text = item if isinstance(item, (tuple, list)) else ('', item)
+        f = parse_vancouver_ref(text)
+        if not (f['authors'] or f['title']):
+            continue
+        e = ["%0 Journal Article"]
+        e += ["%A " + a for a in f['authors']]
+        if f['title']:   e.append("%T " + f['title'])
+        if f['journal']: e.append("%J " + f['journal'])
+        if f['volume']:  e.append("%V " + f['volume'])
+        if f['issue']:   e.append("%N " + f['issue'])
+        if f['spage'] and f['epage']: e.append("%P " + f['spage'] + "-" + f['epage'])
+        elif f['spage']: e.append("%P " + f['spage'])
+        if f['year']:    e.append("%D " + f['year'])
+        if label:        e.append("%1 " + str(label))
+        out.append("\n".join(e))
+    return "\n\n".join(out) + "\n"
+
+def build_reffinder_docx(refs, title="Missing references"):
+    """One clean reference per paragraph (de-hyphenated, single line) so the
+    Find-Missing-References app reads each as ONE reference, never fragments."""
+    from docx import Document
+    doc = Document()
+    doc.add_heading(title, level=1)
+    for item in refs:
+        label, text = item if isinstance(item, (tuple, list)) else ('', item)
+        text = re.sub(r'[\u00ad]', '', text or '')
+        text = re.sub(r'-\s+', '-', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if text:
+            doc.add_paragraph(text)
+    buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
+
+def missing_refs_files(refs):
+    """Convenience: -> dict with 'ris', 'enw', 'docx' bytes for a list of refs."""
+    return {'ris': refs_to_ris(refs).encode('utf-8'),
+            'enw': refs_to_enw(refs).encode('utf-8'),
+            'docx': build_reffinder_docx(refs)}
